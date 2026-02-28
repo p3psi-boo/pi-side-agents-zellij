@@ -1227,13 +1227,32 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			}
 
 			const lines: string[] = [];
+			const failedIds: string[] = [];
 			for (const record of records) {
 				const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 				lines.push(`${record.id}  ${record.status}  win:${win}  branch:${record.branch ?? "-"}`);
 				lines.push(`  task: ${record.task}`);
 				if (record.error) lines.push(`  error: ${record.error}`);
+				if (record.status === "failed" || record.status === "crashed") {
+					failedIds.push(record.id);
+				}
 			}
 			renderInfoMessage(pi, ctx, "parallel-agents", lines);
+
+			if (failedIds.length > 0 && ctx.hasUI) {
+				const confirmed = await ctx.ui.confirm(
+					"Clean up failed agents?",
+					`Remove ${failedIds.length} failed/crashed agent(s) from registry: ${failedIds.join(", ")}`,
+				);
+				if (confirmed) {
+					await mutateRegistry(stateRoot, async (registry) => {
+						for (const id of failedIds) {
+							delete registry.agents[id];
+						}
+					});
+					ctx.ui.notify(`Removed ${failedIds.length} agent(s): ${failedIds.join(", ")}`, "info");
+				}
+			}
 		},
 	});
 
