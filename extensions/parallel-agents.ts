@@ -1039,6 +1039,11 @@ async function sendToAgent(stateRoot: string, agentId: string, prompt: string): 
 	if (payload.startsWith("!")) {
 		tmuxInterrupt(record.tmuxWindowId);
 		payload = payload.slice(1).trimStart();
+		if (payload.length > 0) {
+			// Brief pause so Pi can finish handling the interrupt and return to an
+			// interactive prompt before the follow-up text lands in the pane.
+			await sleep(300);
+		}
 	}
 	if (payload.length > 0) {
 		tmuxSendPrompt(record.tmuxWindowId, payload);
@@ -1062,15 +1067,25 @@ async function waitForAny(stateRoot: string, ids: string[], signal?: AbortSignal
 		return { ok: false, error: "No agent ids were provided" };
 	}
 
+	let firstPass = true;
+
 	while (true) {
 		if (signal?.aborted) {
 			return { ok: false, error: "agent-wait-any aborted" };
 		}
 
+		const unknownOnFirstPass: string[] = [];
+
 		for (const id of uniqueIds) {
 			const checked = await agentCheckPayload(stateRoot, id);
 			const ok = checked.ok === true;
-			if (!ok) continue;
+			if (!ok) {
+				// Track unknown IDs on the first pass so we can fail fast.
+				// On subsequent passes we tolerate disappearing agents (e.g. deleted from
+				// the registry) rather than spinning forever.
+				if (firstPass) unknownOnFirstPass.push(id);
+				continue;
+			}
 			const status = (checked.agent as any)?.status as AgentStatus | undefined;
 			if (!status) continue;
 			if (isTerminalStatus(status)) {
@@ -1078,6 +1093,16 @@ async function waitForAny(stateRoot: string, ids: string[], signal?: AbortSignal
 			}
 		}
 
+		// Fail immediately if any provided ID was unrecognised on the very first
+		// poll — unknown agents will never become known, so waiting is pointless.
+		if (firstPass && unknownOnFirstPass.length > 0) {
+			return {
+				ok: false,
+				error: `Unknown agent id(s): ${unknownOnFirstPass.join(", ")}`,
+			};
+		}
+
+		firstPass = false;
 		await sleep(1000);
 	}
 }
@@ -1290,9 +1315,9 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background parallel child agent in tmux/worktree. Description is sent as kickoff prompt. Returns id tied to tmux window id.",
+			"Start a background parallel child agent in tmux/worktree. The description is used directly as the child's kickoff prompt — no automatic context summary is added, so embed all relevant context in description. Returns { ok: true, id, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
-			description: Type.String({ description: "Task description for child agent kickoff prompt" }),
+			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			model: Type.Optional(Type.String({ description: "Model as provider/modelId (optional)" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1308,6 +1333,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 							type: "text",
 							text: JSON.stringify(
 								{
+									ok: true,
 									id: started.id,
 									tmuxWindowId: started.tmuxWindowId,
 									tmuxWindowIndex: started.tmuxWindowIndex,
@@ -1332,30 +1358,44 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "agent-check",
 		label: "Agent Check",
-		description: "Check a given parallel agent status and return backlog tail (last 10 lines).",
+		description:
+			"Check a given parallel agent status and return backlog tail (last 10 lines). Returns { ok: true, agent: { id, status, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. Terminal statuses: done | failed | crashed. Non-terminal: allocating_worktree | spawning_tmux | starting | running | waiting_user | finishing | waiting_merge_lock | retrying_reconcile.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const payload = await agentCheckPayload(getStateRoot(ctx), params.id);
-			return {
-				content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-			};
+			try {
+				const payload = await agentCheckPayload(getStateRoot(ctx), params.id);
+				return {
+					content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: JSON.stringify({ ok: false, error: stringifyError(err) }, null, 2) }],
+				};
+			}
 		},
 	});
 
 	pi.registerTool({
 		name: "agent-wait-any",
 		label: "Agent Wait Any",
-		description: "Wait until one of the provided agent ids stops, then return agent-check payload.",
+		description:
+			"Poll until one of the provided agent ids reaches a terminal state (done/failed/crashed), then return that agent's check payload (same shape as agent-check). Returns { ok: false, error } immediately if any id is unknown — unknown agents never become known, so waiting would be pointless. The tool's abort signal is respected between poll cycles (roughly every 1 s).",
 		parameters: Type.Object({
 			ids: Type.Array(Type.String({ description: "Agent id" }), { description: "Agent ids to wait for" }),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const payload = await waitForAny(getStateRoot(ctx), params.ids, signal);
-			return {
-				content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-			};
+			try {
+				const payload = await waitForAny(getStateRoot(ctx), params.ids, signal);
+				return {
+					content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: JSON.stringify({ ok: false, error: stringifyError(err) }, null, 2) }],
+				};
+			}
 		},
 	});
 
@@ -1363,16 +1403,22 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-send",
 		label: "Agent Send",
 		description:
-			"Send steering/follow-up prompt to child agent. If prompt starts with !, interrupt first. If prompt starts with /, it is sent as a slash command.",
+			"Send a steering/follow-up prompt to a child agent's tmux pane. Prefix rules: '!' — send C-c interrupt first; if there is additional text after '!', a 300 ms pause is inserted before sending it so Pi can return to interactive prompt. '/' — forwarded as-is; Pi treats lines beginning with '/' as slash commands. Send '!' alone to interrupt without a follow-up. Returns { ok: boolean, message: string }.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
-			prompt: Type.String({ description: "Prompt text to send" }),
+			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first, '/' for slash commands)" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const payload = await sendToAgent(getStateRoot(ctx), params.id, params.prompt);
-			return {
-				content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-			};
+			try {
+				const payload = await sendToAgent(getStateRoot(ctx), params.id, params.prompt);
+				return {
+					content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: JSON.stringify({ ok: false, error: stringifyError(err) }, null, 2) }],
+				};
+			}
 		},
 	});
 

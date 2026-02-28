@@ -16,7 +16,7 @@
 - [x] Add typed models for Agent, WorktreeSlot, RegistryState.
 - [ ] Add logging helpers and error taxonomy.
 
-**Exit criteria**: module skeleton in place; test harness still pending.
+**Exit criteria**: module skeleton in place; baseline integration harness added.
 
 ## Phase 1 — `/agent` baseline command
 
@@ -63,9 +63,17 @@
 - [x] `agent-check` tool.
 - [x] `agent-wait-any` tool.
 - [x] `agent-send` tool with `!` interrupt and `/` command forwarding.
-- [ ] Add integration tests for multi-agent orchestration.
+- [x] Add integration tests for multi-agent orchestration.
+- [x] Audit and harden tool contracts:
+  - `agent-start` success response now includes `ok: true` (consistent with error shape).
+  - `agent-wait-any` fails fast (`{ ok: false }`) on first-pass unknown IDs instead of looping forever.
+  - `agent-send` inserts a 300 ms pause after C-c interrupt so Pi can return to prompt before text lands.
+  - `agent-check`, `agent-wait-any`, `agent-send` tools now wrapped in try/catch (registry lock timeout no longer propagates as an unhandled throw).
+  - Tool descriptions updated to document exact input/output shapes, prefix semantics, and signal behaviour.
+- [x] Add unit test suite (`tests/unit/tool-contract.test.mjs`, `npm run test:unit`) — 19 tests covering pure helpers, JSON shapes, `waitForAny` fail-fast, interrupt prefix stripping, branch naming.
+- [x] Document tool contract in `README.md` ("Tool contract" section).
 
-**Exit criteria**: orchestration primitives are implemented; tests pending.
+**Exit criteria**: ✅ orchestration primitives implemented, integration-tested, contract-hardened, and documented.
 
 ## Phase 6 — Hardening
 
