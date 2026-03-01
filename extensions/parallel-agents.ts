@@ -1090,6 +1090,82 @@ function parseAgentCommandArgs(raw: string): { task: string; model?: string } {
 	};
 }
 
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+function splitModelPatternAndThinking(raw: string): { pattern: string; thinking?: string } {
+	const trimmed = raw.trim();
+	const colon = trimmed.lastIndexOf(":");
+	if (colon <= 0 || colon === trimmed.length - 1) return { pattern: trimmed };
+
+	const suffix = trimmed.slice(colon + 1);
+	if (!THINKING_LEVELS.has(suffix)) return { pattern: trimmed };
+
+	return {
+		pattern: trimmed.slice(0, colon),
+		thinking: suffix,
+	};
+}
+
+function withThinking(modelSpec: string, thinking?: string): string {
+	return thinking ? `${modelSpec}:${thinking}` : modelSpec;
+}
+
+async function resolveModelSpecForChild(
+	ctx: ExtensionContext,
+	requested?: string,
+): Promise<{ modelSpec?: string; warning?: string }> {
+	const currentModelSpec = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	if (!requested || requested.trim().length === 0) {
+		return { modelSpec: currentModelSpec };
+	}
+
+	const trimmed = requested.trim();
+	if (trimmed.includes("/")) {
+		return { modelSpec: trimmed };
+	}
+
+	const { pattern, thinking } = splitModelPatternAndThinking(trimmed);
+
+	if (ctx.model && pattern === ctx.model.id) {
+		return {
+			modelSpec: withThinking(`${ctx.model.provider}/${ctx.model.id}`, thinking),
+		};
+	}
+
+	try {
+		const available = (await ctx.modelRegistry.getAvailable()) as Array<{ provider: string; id: string }>;
+		const exact = available.filter((model) => model.id === pattern);
+
+		if (exact.length === 1) {
+			const match = exact[0];
+			return {
+				modelSpec: withThinking(`${match.provider}/${match.id}`, thinking),
+			};
+		}
+
+		if (exact.length > 1) {
+			if (ctx.model) {
+				const preferred = exact.find((model) => model.provider === ctx.model?.provider);
+				if (preferred) {
+					return {
+						modelSpec: withThinking(`${preferred.provider}/${preferred.id}`, thinking),
+					};
+				}
+			}
+
+			const providers = [...new Set(exact.map((model) => model.provider))].sort();
+			return {
+				modelSpec: trimmed,
+				warning: `Model '${pattern}' matches multiple providers (${providers.join(", ")}); child was started with raw pattern '${trimmed}'. Use provider/model to force a specific provider.`,
+			};
+		}
+	} catch {
+		// Best effort only; keep raw model pattern.
+	}
+
+	return { modelSpec: trimmed };
+}
+
 function normalizeAgentId(raw: string): string {
 	const trimmed = raw.trim();
 	if (!trimmed) return "";
@@ -1160,8 +1236,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		await atomicWrite(promptPath, kickoff.prompt + "\n");
 		await atomicWrite(logPath, "");
 
-		const defaultModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		const modelSpec = params.model ?? defaultModel;
+		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
+		const modelSpec = resolvedModel.modelSpec;
+		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
 		const tmuxSession = getCurrentTmuxSession();
 		const { windowId, windowIndex } = createTmuxWindow(tmuxSession, `agent-${agentId}`);
@@ -1202,6 +1279,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.promptPath = promptPath;
 			record.logPath = logPath;
 			record.exitFile = exitFile;
+			record.model = modelSpec;
 			record.status = "running";
 			record.updatedAt = nowIso();
 			record.warnings = [...(record.warnings ?? []), ...aggregatedWarnings];
