@@ -110,6 +110,12 @@ type StartAgentResult = {
 	prompt: string;
 };
 
+type PrepareRuntimeDirResult = {
+	runtimeDir: string;
+	archivedRuntimeDir?: string;
+	warning?: string;
+};
+
 type ExitMarker = {
 	exitCode?: number;
 	finishedAt?: string;
@@ -404,6 +410,53 @@ function getRegistryLockPath(stateRoot: string): string {
 
 function getRuntimeDir(stateRoot: string, agentId: string): string {
 	return join(getMetaDir(stateRoot), "runtime", agentId);
+}
+
+function getRuntimeArchiveBaseDir(stateRoot: string, agentId: string): string {
+	return join(getMetaDir(stateRoot), "runtime-archive", agentId);
+}
+
+function runtimeArchiveStamp(): string {
+	return nowIso().replace(/[:.]/g, "-");
+}
+
+async function prepareFreshRuntimeDir(stateRoot: string, agentId: string): Promise<PrepareRuntimeDirResult> {
+	const runtimeDir = getRuntimeDir(stateRoot, agentId);
+	if (!(await fileExists(runtimeDir))) {
+		await ensureDir(runtimeDir);
+		return { runtimeDir };
+	}
+
+	const archiveBaseDir = getRuntimeArchiveBaseDir(stateRoot, agentId);
+	const archiveDir = join(
+		archiveBaseDir,
+		`${runtimeArchiveStamp()}-${process.pid}-${Math.random().toString(16).slice(2, 8)}`,
+	);
+
+	try {
+		await ensureDir(archiveBaseDir);
+		await fs.rename(runtimeDir, archiveDir);
+		await ensureDir(runtimeDir);
+		return {
+			runtimeDir,
+			archivedRuntimeDir: archiveDir,
+		};
+	} catch (archiveErr) {
+		const archiveErrMessage = stringifyError(archiveErr);
+		try {
+			await fs.rm(runtimeDir, { recursive: true, force: true });
+			await ensureDir(runtimeDir);
+		} catch (cleanupErr) {
+			throw new Error(
+				`Failed to prepare runtime dir ${runtimeDir}: archive failed (${archiveErrMessage}); cleanup failed (${stringifyError(cleanupErr)})`,
+			);
+		}
+
+		return {
+			runtimeDir,
+			warning: `Failed to archive existing runtime dir for ${agentId}: ${archiveErrMessage}. Removed stale runtime directory instead.`,
+		};
+	}
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -1397,8 +1450,15 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		allocatedBranch = worktree.branch;
 		aggregatedWarnings = [...worktree.warnings];
 
-		const runtimeDir = getRuntimeDir(stateRoot, agentId);
-		await ensureDir(runtimeDir);
+		const runtimePrep = await prepareFreshRuntimeDir(stateRoot, agentId);
+		const runtimeDir = runtimePrep.runtimeDir;
+		if (runtimePrep.archivedRuntimeDir) {
+			aggregatedWarnings.push(`Archived existing runtime dir for ${agentId}: ${runtimePrep.archivedRuntimeDir}`);
+		}
+		if (runtimePrep.warning) {
+			aggregatedWarnings.push(runtimePrep.warning);
+		}
+
 		const promptPath = join(runtimeDir, "kickoff.md");
 		const logPath = join(runtimeDir, "backlog.log");
 		const exitFile = join(runtimeDir, "exit.json");

@@ -609,6 +609,20 @@ async function createHarness(t, options = {}) {
 		);
 	}
 
+	if (options.staleRuntimeDirForId) {
+		const staleRuntimeDir = join(repoRoot, ".pi", "side-agents", "runtime", options.staleRuntimeDirForId);
+		const staleMarker = `stale-runtime-marker-${options.staleRuntimeDirForId}`;
+		await mkdir(staleRuntimeDir, { recursive: true });
+		await writeFile(join(staleRuntimeDir, "backlog.log"), `${staleMarker}\n`, "utf8");
+		await writeFile(join(staleRuntimeDir, "kickoff.md"), `${staleMarker}\n`, "utf8");
+		await writeFile(
+			join(staleRuntimeDir, "exit.json"),
+			JSON.stringify({ exitCode: 0, finishedAt: "2025-01-01T00:00:00.000Z" }) + "\n",
+			"utf8",
+		);
+		await writeFile(join(staleRuntimeDir, "launch.sh"), `#!/usr/bin/env bash\necho ${staleMarker}\n`, "utf8");
+	}
+
 	await copyFile(AUTH_SOURCE, join(agentDir, "auth.json"));
 	await writeFile(
 		join(agentDir, "settings.json"),
@@ -810,6 +824,60 @@ test(
 		);
 
 		await closeChildWindowAfterPrompt(harness, agentId);
+	},
+);
+
+test(
+	"integration: stale runtime dir is archived before reuse and does not auto-close the new agent",
+	{ timeout: TEST_TIMEOUT },
+	async (t) => {
+		if (!assertAuthOrSkip(t)) return;
+
+		const harness = await createHarness(t, { staleRuntimeDirForId: "a-0001" });
+		const runtimeDir = join(harness.repoRoot, ".pi", "side-agents", "runtime", "a-0001");
+		const staleExitPath = join(runtimeDir, "exit.json");
+		const staleMarker = "stale-runtime-marker-a-0001";
+
+		assert.equal(await exists(staleExitPath), true, "fixture should create stale exit.json before launch");
+
+		await sendParentCommand(harness, `/agent -model ${MODEL_SPEC} runtime archive regression`);
+		await waitForSpawnedAgent(harness, "a-0001", 180_000);
+
+		const runningCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
+		assert.equal(
+			runningCheck.payload.ok,
+			true,
+			`stale runtime exit marker must not auto-remove new agent: ${JSON.stringify(runningCheck.payload)}`,
+		);
+		assert.equal(await exists(staleExitPath), false, "fresh runtime dir should not carry stale exit.json into new run");
+
+		const archiveBase = join(harness.repoRoot, ".pi", "side-agents", "runtime-archive", "a-0001");
+		const archivedDir = await waitFor(
+			"archived runtime dir for a-0001",
+			async () => {
+				if (!(await exists(archiveBase))) return false;
+				const entries = await readdir(archiveBase, { withFileTypes: true });
+				for (const entry of entries) {
+					if (!entry.isDirectory()) continue;
+					const candidate = join(archiveBase, entry.name);
+					const backlogPath = join(candidate, "backlog.log");
+					if (!(await exists(backlogPath))) continue;
+					const backlog = await readFile(backlogPath, "utf8");
+					if (backlog.includes(staleMarker)) {
+						return candidate;
+					}
+				}
+				return false;
+			},
+			{ timeoutMs: 60_000, intervalMs: 300 },
+		);
+		assert.equal(await exists(join(archivedDir, "exit.json")), true, "archived runtime should preserve stale exit marker");
+
+		await waitForChildPiBooted(harness, "a-0001", 120_000);
+		const quitSend = await callAgentSendTool(harness, "a-0001", "!/quit", 60_000);
+		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
+		await waitForAgent(harness, "a-0001", { terminal: true, timeoutMs: 180_000 });
+		await closeChildWindowAfterPrompt(harness, "a-0001");
 	},
 );
 
