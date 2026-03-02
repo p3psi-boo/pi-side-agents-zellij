@@ -53,7 +53,7 @@ Create the three files below. For each file, check whether it already exists bef
 
 Write this file and make it executable (`chmod +x`).
 
-Use `MAIN_BRANCH` set to whatever the user specified in question 1 (or `main` by default). The start script must enforce branch/head sync **before** bootstrap. Do **not** force-update the local `MAIN_BRANCH` ref (e.g. `git branch -f`) because that branch is often checked out in the parent worktree.
+Use `MAIN_BRANCH` set to whatever the user specified in question 1 (or `main` by default). The start script validates the branch but does **not** reset HEAD — the TypeScript extension already sets the worktree to the parent's HEAD. Do **not** force-update the local `MAIN_BRANCH` ref (e.g. `git branch -f`) because that branch is often checked out in the parent worktree.
 
 **Default content** — substitute `MAIN_BRANCH_VALUE` with the actual branch name, then append bootstrap steps based on question 2:
 
@@ -74,40 +74,14 @@ fi
 
 echo "[side-agent-start] agent=$AGENT_ID branch=$BRANCH main=$MAIN_BRANCH"
 
-REMOTE_MAIN_REF="refs/remotes/origin/$MAIN_BRANCH"
-LOCAL_MAIN_REF="refs/heads/$MAIN_BRANCH"
-
-if git -C "$WORKTREE" remote get-url origin >/dev/null 2>&1; then
-  echo "[side-agent-start] Fetching origin/$MAIN_BRANCH..."
-  git -C "$WORKTREE" fetch --prune origin "$MAIN_BRANCH" >/dev/null 2>&1 || \
-    echo "[side-agent-start] origin/$MAIN_BRANCH not fetched (missing branch or fetch failure)."
-else
-  echo "[side-agent-start] No origin remote configured; checking local refs only."
-fi
-
-BASE_REF=""
-BASE_LABEL=""
-if git -C "$WORKTREE" show-ref --verify --quiet "$REMOTE_MAIN_REF"; then
-  BASE_REF="$REMOTE_MAIN_REF"
-  BASE_LABEL="origin/$MAIN_BRANCH"
-elif git -C "$WORKTREE" show-ref --verify --quiet "$LOCAL_MAIN_REF"; then
-  BASE_REF="$LOCAL_MAIN_REF"
-  BASE_LABEL="$MAIN_BRANCH"
-  echo "[side-agent-start] origin/$MAIN_BRANCH missing; using local $MAIN_BRANCH as fallback."
-else
-  echo "[side-agent-start] ERROR: missing both origin/$MAIN_BRANCH and local $MAIN_BRANCH."
-  echo "[side-agent-start] Create/fetch $MAIN_BRANCH and rerun."
-  exit 1
-fi
-
 if [[ "$BRANCH" == "$MAIN_BRANCH" ]]; then
   echo "[side-agent-start] ERROR: child worktree is on $MAIN_BRANCH; expected a dedicated agent branch."
   exit 1
 fi
 
-echo "[side-agent-start] Resetting $BRANCH to $BASE_LABEL."
-git -C "$WORKTREE" checkout "$BRANCH" >/dev/null 2>&1
-git -C "$WORKTREE" reset --hard "$BASE_REF" >/dev/null
+# The worktree is already set to the parent's HEAD by the TypeScript extension.
+# Just verify it's on the right branch.
+echo "[side-agent-start] Worktree based on parent HEAD ($(git -C "$WORKTREE" rev-parse --short HEAD))."
 ```
 
 - If the user wants **no custom bootstrap**: append the optional hook block:
