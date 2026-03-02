@@ -10,6 +10,7 @@
     "pi-package",
     "parallel",
     "agent",
+    "subagent",
     "tmux",
     "worktree"
   ],
