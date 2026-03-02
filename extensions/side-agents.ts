@@ -1900,16 +1900,26 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 	return transitions.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function formatStatusTransitionMessage(transition: StatusTransitionNotice): string {
+function formatStatusWord(status: AgentStatus, theme?: { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string }): string {
+	if (!theme) return status;
+	return theme.fg(statusColorRole(status), status);
+}
+
+function formatStatusTransitionMessage(
+	transition: StatusTransitionNotice,
+	theme?: { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string },
+): string {
 	const win = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex})` : "";
-	return `side-agent ${transition.id}: ${transition.fromStatus} -> ${transition.toStatus}${win}`;
+	const from = formatStatusWord(transition.fromStatus, theme);
+	const to = formatStatusWord(transition.toStatus, theme);
+	return `side-agent ${transition.id}: ${from} -> ${to}${win}`;
 }
 
 function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transitions: StatusTransitionNotice[]): void {
 	if (isChildRuntime()) return;
 
 	for (const transition of transitions) {
-		const message = formatStatusTransitionMessage(transition);
+		const message = formatStatusTransitionMessage(transition, ctx.hasUI ? ctx.ui.theme : undefined);
 		pi.sendMessage(
 			{
 				customType: STATUS_UPDATE_MESSAGE_TYPE,
@@ -2078,8 +2088,9 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				for (const [index, record] of records.entries()) {
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
+					const statusWord = formatStatusWord(record.status, ctx.hasUI ? ctx.ui.theme : undefined);
 					lines.push(
-						`${record.id}  ${record.status}  win:${win}  branch:${record.branch ?? "-"}  worktree:${worktreeName}`,
+						`${record.id}  ${statusWord}  win:${win}  branch:${record.branch ?? "-"}  worktree:${worktreeName}`,
 					);
 					lines.push(`  task: ${summarizeTask(record.task)}`);
 					if (record.error) lines.push(`  error: ${record.error}`);
