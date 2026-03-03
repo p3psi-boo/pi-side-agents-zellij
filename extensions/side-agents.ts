@@ -1900,15 +1900,19 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 	return transitions.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function formatStatusWord(status: AgentStatus, theme?: { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string }): string {
+type ThemeForeground = { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string };
+
+function formatStatusWord(status: AgentStatus, theme?: ThemeForeground): string {
 	if (!theme) return status;
 	return theme.fg(statusColorRole(status), status);
 }
 
-function formatStatusTransitionMessage(
-	transition: StatusTransitionNotice,
-	theme?: { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string },
-): string {
+function formatLabelPrefix(prefix: string, theme?: ThemeForeground): string {
+	if (!theme) return prefix;
+	return theme.fg("muted", prefix);
+}
+
+function formatStatusTransitionMessage(transition: StatusTransitionNotice, theme?: ThemeForeground): string {
 	const win = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex})` : "";
 	const from = formatStatusWord(transition.fromStatus, theme);
 	const to = formatStatusWord(transition.toStatus, theme);
@@ -2086,14 +2090,16 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			if (records.length === 0) {
 				lines.push("(no tracked agents)");
 			} else {
+				const theme = ctx.hasUI ? ctx.ui.theme : undefined;
 				for (const [index, record] of records.entries()) {
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
-					const statusWord = formatStatusWord(record.status, ctx.hasUI ? ctx.ui.theme : undefined);
-					lines.push(
-						`${record.id}  ${statusWord}  win:${win}  branch:${record.branch ?? "-"}  worktree:${worktreeName}`,
-					);
-					lines.push(`  task: ${summarizeTask(record.task)}`);
+					const statusWord = formatStatusWord(record.status, theme);
+					const winPrefix = formatLabelPrefix("win:", theme);
+					const worktreePrefix = formatLabelPrefix("worktree:", theme);
+					const taskPrefix = formatLabelPrefix("task:", theme);
+					lines.push(`${record.id}  ${statusWord}  ${winPrefix}${win}  ${worktreePrefix}${worktreeName}`);
+					lines.push(`  ${taskPrefix} ${summarizeTask(record.task)}`);
 					if (record.error) lines.push(`  error: ${record.error}`);
 					if (record.status === "failed" || record.status === "crashed") {
 						failedIds.push(record.id);
