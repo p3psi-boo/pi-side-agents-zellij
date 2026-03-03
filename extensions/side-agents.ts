@@ -18,16 +18,18 @@ const CHILD_LINK_ENTRY_TYPE = "side-agent-link";
 const STATUS_UPDATE_MESSAGE_TYPE = "side-agent-status";
 const PROMPT_UPDATE_MESSAGE_TYPE = "side-agent-prompt";
 
-const SUMMARY_SYSTEM_PROMPT = `You are writing a handoff summary for a background coding agent.
+const SUMMARY_SYSTEM_PROMPT = `You are writing a minimal handoff summary for a background coding agent.
 
-Given the full parent conversation and the requested child task, produce a concise context package with:
+Use the parent conversation only as context. Include only details that are directly relevant to the child task.
 
-1) Current objective and relevant constraints
-2) Decisions already made
-3) Important files/components to inspect
-4) Risks or caveats the child should know
+If the parent conversation is unrelated to the child task, output exactly:
+NONE
 
-Keep it short and actionable.`;
+Preferred content (but only when relevant):
+- objective/constraints already established
+- decisions already made
+- key files/components to inspect
+- risks/caveats`;
 
 type AgentStatus =
 	| "allocating_worktree"
@@ -185,6 +187,9 @@ const BACKLOG_SEPARATOR_RE = /^[-─—_=]{5,}$/u;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+const SUMMARY_MAX_LINES = 10;
+const SUMMARY_MAX_CHARS = 700;
+const SUMMARY_NONE_RE = /^(?:none|n\/a|no relevant context(?: from parent session)?\.?|unrelated)\s*$/i;
 
 function resolveBacklogPathForRecord(stateRoot: string, record: AgentRecord): string {
 	if (record.logPath) return record.logPath;
@@ -287,6 +292,35 @@ function truncateWithEllipsis(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	if (maxChars === 1) return "…";
 	return `${text.slice(0, maxChars - 1)}…`;
+}
+
+function normalizeGeneratedSummary(raw: string): string {
+	const cleaned = stripTerminalNoise(raw).trim();
+	if (!cleaned) return "";
+
+	const fenced = cleaned.match(/^```(?:markdown|md)?\s*\n?([\s\S]*?)\n?```$/i);
+	const unfenced = (fenced ? fenced[1] : cleaned).trim();
+	if (!unfenced) return "";
+	if (SUMMARY_NONE_RE.test(unfenced)) return "";
+
+	const compactLines: string[] = [];
+	let previousBlank = false;
+	for (const rawLine of unfenced.replace(/\r\n?/g, "\n").split("\n")) {
+		const line = rawLine.trimEnd();
+		const blank = line.trim().length === 0;
+		if (blank) {
+			if (previousBlank) continue;
+			previousBlank = true;
+		} else {
+			previousBlank = false;
+		}
+		compactLines.push(line);
+		if (compactLines.length >= SUMMARY_MAX_LINES) break;
+	}
+
+	const summary = compactLines.join("\n").trim();
+	if (!summary || SUMMARY_NONE_RE.test(summary)) return "";
+	return truncateWithEllipsis(summary, SUMMARY_MAX_CHARS);
 }
 
 function summarizeTask(task: string): string {
@@ -1035,14 +1069,15 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 			{ apiKey },
 		);
 
-		const summary = response.content
-			.filter((block): block is { type: "text"; text: string } => block.type === "text")
-			.map((block) => block.text)
-			.join("\n")
-			.trim();
+		const summary = normalizeGeneratedSummary(
+			response.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join("\n"),
+		);
 
 		if (!summary) {
-			return { prompt: task, warning: "Context summary was empty; started child with raw task only." };
+			return { prompt: task };
 		}
 
 		const prompt = [
@@ -1051,7 +1086,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 			"## Parent session",
 			parentSession ? `- ${parentSession}` : "- (unknown)",
 			"",
-			"## Context summary",
+			"## Relevant parent context",
 			summary,
 		].join("\n");
 
