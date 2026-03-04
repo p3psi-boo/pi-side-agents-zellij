@@ -1054,8 +1054,9 @@ async function allocateWorktree(options: {
 
 async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSummary: boolean): Promise<{ prompt: string; warning?: string }> {
 	const parentSession = ctx.sessionManager.getSessionFile();
+	const sessionSuffix = parentSession ? `\n\nParent Pi session: ${parentSession}` : "";
 	if (!includeSummary || !ctx.model) {
-		return { prompt: task };
+		return { prompt: task + sessionSuffix };
 	}
 
 	const branch = ctx.sessionManager.getBranch();
@@ -1064,7 +1065,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		.map((entry) => entry.message);
 
 	if (messages.length === 0) {
-		return { prompt: task };
+		return { prompt: task + sessionSuffix };
 	}
 
 	try {
@@ -1096,7 +1097,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		);
 
 		if (!summary) {
-			return { prompt: task };
+			return { prompt: task + sessionSuffix };
 		}
 
 		const prompt = [
@@ -1112,7 +1113,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		return { prompt };
 	} catch (err) {
 		return {
-			prompt: task,
+			prompt: task + sessionSuffix,
 			warning: `Failed to generate context summary: ${stringifyError(err)}. Started child with raw task only.`,
 		};
 	}
