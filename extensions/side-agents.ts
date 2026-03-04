@@ -2243,11 +2243,15 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "agent-start"
-		,
+		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Returns { ok: true, id, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background side agent in tmux/worktree. " +
+			"Lifecycle: child should implement the change, then yield for review (do not auto-/quit); " +
+			"parent/user inspects, asks child to wrap up (finish flow), then quits. " +
+			"The description is sent verbatim (no automatic context summary), so include all necessary context. " +
+			"Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. " +
+			"Returns { ok: true, id, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
@@ -2294,7 +2298,12 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-check",
 		label: "Agent Check",
 		description:
-			"Check a given side agent status and return compact recent output. Returns { ok: true, agent: { id, status, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. backlog is sanitized/truncated for LLM safety; task is a compact preview. Statuses: allocating_worktree | spawning_tmux | starting | running | waiting_user | finishing | waiting_merge_lock | retrying_reconcile | failed | crashed. Agents that exit with code 0 are auto-removed from registry.",
+			"Check a given side agent status and return compact recent output. " +
+			"Returns { ok: true, agent: { id, status, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, " +
+			"or { ok: false, error } if the agent id is unknown or a registry error occurs. " +
+			"backlog is sanitized/truncated for LLM safety; task is a compact preview. " +
+			"Statuses: allocating_worktree | spawning_tmux | starting | running | waiting_user | finishing | waiting_merge_lock | retrying_reconcile | failed | crashed. " +
+			"Agents that exit with code 0 are auto-removed from registry.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
 		}),
@@ -2316,12 +2325,20 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-wait-any",
 		label: "Agent Wait Any",
 		description:
-			"Poll until one of the provided agent ids reaches a target state, then return that agent's check payload (same shape as agent-check). Default wait states: waiting_user | failed | crashed. Optionally pass states[] to override. Returns { ok: false, error } immediately if any id is unknown on first pass. Successful exitCode 0 agents are auto-pruned from registry; if all tracked ids disappear, this tool returns an error instead of polling forever. The tool's abort signal is respected between poll cycles (roughly every 1 s).",
+			"Poll until one of the provided agent ids reaches a target state, then return that agent's check payload (same shape as agent-check). " +
+			"Default wait states: waiting_user | failed | crashed. " +
+			"Optionally pass states[] to override. " +
+			"Returns { ok: false, error } immediately if any id is unknown on first pass. " +
+			"Successful exitCode 0 agents are auto-pruned from registry; if all tracked ids disappear, this tool returns an error instead of polling forever. " +
+			"The tool's abort signal is respected between poll cycles (roughly every 1 s).",
 		parameters: Type.Object({
 			ids: Type.Array(Type.String({ description: "Agent id" }), { description: "Agent ids to wait for" }),
 			states: Type.Optional(
 				Type.Array(Type.String({ description: "Agent status value" }), {
-					description: "Optional target states to wait for. Default: waiting_user, failed, crashed",
+					description:
+						"Optional target states to wait for. Default: waiting_user, failed, crashed. " +
+						"You almost never need to set this — the defaults cover all cases where an agent needs your attention. " +
+						"WARNING: narrowing this (e.g. to only 'failed') will cause the tool to spin forever if the agent reaches a state you excluded (e.g. waiting_user).",
 				}),
 			),
 		}),
@@ -2343,10 +2360,14 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-send",
 		label: "Agent Send",
 		description:
-			"Send a steering/follow-up prompt to a child agent's tmux pane. Returns { ok: boolean, message: string }.",
+			"Send a steering/follow-up prompt to a child agent's tmux pane. " +
+			"Prefix rules: '!' — send C-c interrupt first; if there is additional text after '!', a 300 ms pause is inserted before sending it so Pi can return to interactive prompt. " +
+			"'/' — forwarded as-is; Pi treats lines beginning with '/' as slash commands. " +
+			"Send '!' alone to interrupt without a follow-up. " +
+			"Returns { ok: boolean, message: string }.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
-			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first instead of organic steering, '/' for slash commands like /quit)" }),
+			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first, '/' for slash commands)" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
