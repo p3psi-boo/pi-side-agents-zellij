@@ -1065,7 +1065,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		.map((entry) => entry.message);
 
 	if (messages.length === 0) {
-		return { prompt: task + sessionSuffix };
+		return { prompt: task };
 	}
 
 	try {

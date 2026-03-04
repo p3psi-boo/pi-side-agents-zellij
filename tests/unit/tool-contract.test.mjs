@@ -789,7 +789,11 @@ test("agent-send '/' prefix is forwarded verbatim (no special parse)", () => {
 
 /**
  * Re-implementation of the session-suffix logic from buildKickoffPrompt.
- * When no summary is generated, the kickoff prompt is task + sessionSuffix.
+ *
+ * The real function appends the parent session path in all cases except when
+ * includeSummary is true but there are zero messages (nothing to query back).
+ * This helper covers the "suffix applied" paths; the no-messages early-return
+ * is a separate code path that returns the raw task.
  */
 function buildSimpleKickoffPrompt(task, parentSession) {
 	const sessionSuffix = parentSession ? `\n\nParent Pi session: ${parentSession}` : "";
