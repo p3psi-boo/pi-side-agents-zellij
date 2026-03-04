@@ -1275,6 +1275,13 @@ function tmuxCaptureTail(windowId: string, lines = 10): string[] {
 	return tailLines(captured.stdout, lines);
 }
 
+/** Capture the currently visible tmux pane content (no scrollback). */
+function tmuxCaptureVisible(windowId: string): string[] {
+	const captured = run("tmux", ["capture-pane", "-p", "-t", windowId]);
+	if (!captured.ok) return [];
+	return splitLines(captured.stdout);
+}
+
 type RefreshRuntimeResult = {
 	removeFromRegistry: boolean;
 };
@@ -1353,6 +1360,15 @@ async function refreshAllAgents(stateRoot: string): Promise<RegistryFile> {
 }
 
 async function getBacklogTail(record: AgentRecord, lines = 10): Promise<string[]> {
+	// Prefer the visible tmux pane — it shows what's actually on screen
+	// and avoids noise from TUI footer redraws that pollute the backlog file.
+	if (record.tmuxWindowId && tmuxWindowExists(record.tmuxWindowId)) {
+		const visible = tmuxCaptureVisible(record.tmuxWindowId);
+		const result = sanitizeBacklogLines(collectRecentBacklogLines(visible, lines));
+		if (result.length > 0) return result;
+	}
+
+	// Fall back to the backlog log file (e.g. tmux window gone but file remains).
 	if (record.logPath && (await fileExists(record.logPath))) {
 		try {
 			const raw = await fs.readFile(record.logPath, "utf8");
@@ -1361,11 +1377,6 @@ async function getBacklogTail(record: AgentRecord, lines = 10): Promise<string[]
 		} catch {
 			// fall through
 		}
-	}
-
-	if (record.tmuxWindowId && tmuxWindowExists(record.tmuxWindowId)) {
-		const captured = tmuxCaptureTail(record.tmuxWindowId, TMUX_BACKLOG_CAPTURE_LINES);
-		return sanitizeBacklogLines(collectRecentBacklogLines(captured, lines));
 	}
 
 	return [];
