@@ -58,7 +58,6 @@ type AgentRecord = {
 	zellijSession?: string;
 	zellijPaneId?: string;
 	zellijTabName?: string;
-	zellijTabIndex?: number;
 	launcherPid?: number;
 	worktreePath?: string;
 	branch?: string;
@@ -100,7 +99,6 @@ type StartAgentResult = {
 	id: string;
 	zellijPaneId?: string;
 	zellijTabName: string;
-	zellijTabIndex?: number;
 	worktreePath: string;
 	branch: string;
 	warnings: string[];
@@ -116,6 +114,7 @@ type PrepareRuntimeDirResult = {
 type ExitMarker = {
 	exitCode?: number;
 	finishedAt?: string;
+	launcherPid?: number;
 };
 
 type CommandResult = {
@@ -1203,7 +1202,15 @@ function getCurrentZellijSession(): string {
 function zellijTabExists(tabName: string): boolean {
 	const result = run("zellij", ["action", "query-tab-names"]);
 	if (!result.ok) return false;
-	return result.stdout.split(/\r?\n/).some(line => line.trim() === tabName);
+	return result.stdout.split(/\r?\n/).some((line) => line.trim() === tabName);
+}
+
+function closeZellijTabBestEffort(tabName?: string): void {
+	if (!tabName) return;
+	if (!zellijTabExists(tabName)) return;
+	const switched = run("zellij", ["action", "go-to-tab-name", tabName]);
+	if (!switched.ok) return;
+	run("zellij", ["action", "close-tab"]);
 }
 
 function zellijInterrupt(tabName: string): void {
@@ -1232,10 +1239,14 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 		const exit = (await readJsonFile<ExitMarker>(record.exitFile)) ?? {};
 		if (typeof exit.exitCode === "number") {
 			record.exitCode = exit.exitCode;
+			record.launcherPid = record.launcherPid ?? parseOptionalPid(exit.launcherPid);
 			record.finishedAt = exit.finishedAt ?? record.finishedAt ?? nowIso();
 			const changed = await setRecordStatus(stateRoot, record, exit.exitCode === 0 ? "done" : "failed");
 			if (!changed) {
 				record.updatedAt = nowIso();
+			}
+			if (!isChildRuntime()) {
+				closeZellijTabBestEffort(record.zellijTabName);
 			}
 			await cleanupWorktreeLockBestEffort(record.worktreePath);
 			if (exit.exitCode === 0) {
@@ -1587,6 +1598,10 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			if (zellijPaneId || launcherPid) break;
 		}
 
+		if (launcherPid !== undefined) {
+			await updateWorktreeLock(worktree.worktreePath, { pid: launcherPid });
+		}
+
 		await mutateRegistry(stateRoot, async (registry) => {
 			const record = registry.agents[agentId];
 			if (!record) return;
@@ -1618,10 +1633,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		return started;
 	} catch (err) {
-		if (spawnedTabName && zellijTabExists(spawnedTabName)) {
-			run("zellij", ["action", "go-to-tab-name", spawnedTabName]);
-			run("zellij", ["action", "close-tab"]);
-		}
+		closeZellijTabBestEffort(spawnedTabName);
 
 		if (agentId) {
 			await mutateRegistry(stateRoot, async (registry) => {

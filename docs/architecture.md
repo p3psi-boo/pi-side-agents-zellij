@@ -144,7 +144,7 @@ Example (fields may evolve):
 Notes:
 
 - `sessionId` is initially written as the parent session id, then updated by the **child** session to its own session id once linked.
-- `pid` starts as the parent process pid that reserved the worktree; runtime metadata may add launcher-specific signals later.
+- `pid` is updated to the launcher shell pid once the child tab has started, so orphan detection can use a live runtime process signal.
 - Orphan/stale lockfiles are never auto-deleted; `/agents` can offer a **user-confirmed** reclaim.
 
 ### 5.5 Replicating `.pi/side-agent-*` into worktrees
@@ -172,7 +172,7 @@ This is how child worktrees discover:
 - The tab is created from a generated `layout.kdl` that launches `bash <runtime>/launch.sh` with the child worktree as `cwd`.
 - After creating the tab, the parent toggles back to its previous tab.
 - The launcher records `ZELLIJ_PANE_ID` and its own pid for parent-side tracking.
-- When the launcher process exits, zellij closes the pane/tab naturally; there is no extra “press any key to close” prompt.
+- When the launcher process exits, the next parent-side runtime refresh best-effort closes the finished tab; there is no extra “press any key to close” prompt.
 
 ### 6.3 Child environment variables
 
