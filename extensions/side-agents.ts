@@ -33,7 +33,7 @@ Preferred content (but only when relevant):
 
 type AgentStatus =
 	| "allocating_worktree"
-	| "spawning_tmux"
+	| "spawning_terminal"
 	| "running"
 	| "waiting_user"
 	| "done"
@@ -42,7 +42,7 @@ type AgentStatus =
 
 const ALL_AGENT_STATUSES: AgentStatus[] = [
 	"allocating_worktree",
-	"spawning_tmux",
+	"spawning_terminal",
 	"running",
 	"waiting_user",
 	"failed",
@@ -55,9 +55,11 @@ type AgentRecord = {
 	id: string;
 	parentSessionId?: string;
 	childSessionId?: string;
-	tmuxSession?: string;
-	tmuxWindowId?: string;
-	tmuxWindowIndex?: number;
+	zellijSession?: string;
+	zellijPaneId?: string;
+	zellijTabName?: string;
+	zellijTabIndex?: number;
+	launcherPid?: number;
 	worktreePath?: string;
 	branch?: string;
 	model?: string;
@@ -96,8 +98,9 @@ type StartAgentParams = {
 
 type StartAgentResult = {
 	id: string;
-	tmuxWindowId: string;
-	tmuxWindowIndex: number;
+	zellijPaneId?: string;
+	zellijTabName: string;
+	zellijTabIndex?: number;
 	worktreePath: string;
 	branch: string;
 	warnings: string[];
@@ -127,12 +130,12 @@ type StatusTransitionNotice = {
 	id: string;
 	fromStatus: AgentStatus;
 	toStatus: AgentStatus;
-	tmuxWindowIndex?: number;
+	zellijTabName?: string;
 };
 
 type AgentStatusSnapshot = {
 	status: AgentStatus;
-	tmuxWindowIndex?: number;
+	zellijTabName?: string;
 };
 
 let statusPollTimer: NodeJS.Timeout | undefined;
@@ -174,7 +177,6 @@ const PROMPT_LOG_PREFIX = "[side-agent][prompt]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
-const TMUX_BACKLOG_CAPTURE_LINES = 300;
 const BACKLOG_SEPARATOR_RE = /^[-─—_=]{5,}$/u;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
@@ -228,8 +230,8 @@ function statusShort(status: AgentStatus): string {
 	switch (status) {
 		case "allocating_worktree":
 			return "alloc";
-		case "spawning_tmux":
-			return "tmux";
+		case "spawning_terminal":
+			return "term";
 		case "running":
 			return "run";
 		case "waiting_user":
@@ -247,7 +249,7 @@ function statusColorRole(status: AgentStatus): "warning" | "muted" | "accent" | 
 	switch (status) {
 		// Rare/transient states: highlight so they stand out.
 		case "allocating_worktree":
-		case "spawning_tmux":
+		case "spawning_terminal":
 			return "warning";
 		// Normal working states: keep low visual weight.
 		case "running":
@@ -758,7 +760,7 @@ type OrphanWorktreeLock = {
 	lockPath: string;
 	lockAgentId?: string;
 	lockPid?: number;
-	lockTmuxWindowId?: string;
+	lockZellijTabName?: string;
 	blockers: string[];
 };
 
@@ -813,7 +815,7 @@ function isPidAlive(pid?: number): boolean {
 function summarizeOrphanLock(lock: OrphanWorktreeLock): string {
 	const details: string[] = [];
 	if (lock.lockAgentId) details.push(`agent:${lock.lockAgentId}`);
-	if (lock.lockTmuxWindowId) details.push(`tmux:${lock.lockTmuxWindowId}`);
+	if (lock.lockZellijTabName) details.push(`tab:${lock.lockZellijTabName}`);
 	if (lock.lockPid !== undefined) details.push(`pid:${lock.lockPid}`);
 	if (details.length === 0) return lock.worktreePath;
 	return `${lock.worktreePath} (${details.join(" ")})`;
@@ -835,14 +837,14 @@ async function scanOrphanWorktreeLocks(repoRoot: string, registry: RegistryFile)
 		}
 
 		const lockPid = parseOptionalPid(raw.pid);
-		const lockTmuxWindowId = typeof raw.tmuxWindowId === "string" ? raw.tmuxWindowId : undefined;
+		const lockZellijTabName = typeof raw.zellijTabName === "string" ? raw.zellijTabName : undefined;
 
 		const blockers: string[] = [];
 		if (isPidAlive(lockPid)) {
 			blockers.push(`pid ${lockPid} is still alive`);
 		}
-		if (lockTmuxWindowId && tmuxWindowExists(lockTmuxWindowId)) {
-			blockers.push(`tmux window ${lockTmuxWindowId} is active`);
+		if (lockZellijTabName && zellijTabExists(lockZellijTabName)) {
+			blockers.push(`zellij tab ${lockZellijTabName} is active`);
 		}
 
 		const candidate: OrphanWorktreeLock = {
@@ -850,7 +852,7 @@ async function scanOrphanWorktreeLocks(repoRoot: string, registry: RegistryFile)
 			lockPath,
 			lockAgentId,
 			lockPid,
-			lockTmuxWindowId,
+			lockZellijTabName,
 			blockers,
 		};
 
@@ -1105,11 +1107,11 @@ function buildLaunchScript(params: {
 	parentRepoRoot: string;
 	stateRoot: string;
 	worktreePath: string;
-	tmuxWindowId: string;
 	promptPath: string;
 	exitFile: string;
 	modelSpec?: string;
 	runtimeDir: string;
+	backlogPath: string;
 }): string {
 	return `#!/usr/bin/env bash
 set -euo pipefail
@@ -1119,13 +1121,15 @@ PARENT_SESSION=${shellQuote(params.parentSessionId ?? "")}
 PARENT_REPO=${shellQuote(params.parentRepoRoot)}
 STATE_ROOT=${shellQuote(params.stateRoot)}
 WORKTREE=${shellQuote(params.worktreePath)}
-WINDOW_ID=${shellQuote(params.tmuxWindowId)}
 PROMPT_FILE=${shellQuote(params.promptPath)}
 EXIT_FILE=${shellQuote(params.exitFile)}
 MODEL_SPEC=${shellQuote(params.modelSpec ?? "")}
 RUNTIME_DIR=${shellQuote(params.runtimeDir)}
+BACKLOG_LOG=${shellQuote(params.backlogPath)}
 START_SCRIPT=\"$WORKTREE/.pi/side-agent-start.sh\"
 CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
+PANE_ID_FILE=\"$RUNTIME_DIR/pane.id\"
+LAUNCHER_PID_FILE=\"$RUNTIME_DIR/launcher.pid\"
 
 export ${ENV_AGENT_ID}=\"$AGENT_ID\"
 export ${ENV_PARENT_SESSION}=\"$PARENT_SESSION\"
@@ -1133,9 +1137,13 @@ export ${ENV_PARENT_REPO}=\"$PARENT_REPO\"
 export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
 
+# Record pane ID and launcher PID for parent discovery
+echo "\${ZELLIJ_PANE_ID:-unknown}" > "$PANE_ID_FILE"
+echo "$$" > "$LAUNCHER_PID_FILE"
+
 write_exit() {
   local code="$1"
-  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(date -Is)" > "$EXIT_FILE"
+  printf '{"exitCode":%d,"finishedAt":"%s","launcherPid":%d}\\n' "$code" "$(date -Is)" "$$" > "$EXIT_FILE"
 }
 
 cd "$WORKTREE"
@@ -1148,9 +1156,6 @@ if [[ -x "$START_SCRIPT" ]]; then
   if [[ "$start_exit" -ne 0 ]]; then
     echo "[side-agent] start script failed with code $start_exit"
     write_exit "$start_exit"
-    read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
-    echo
-    tmux kill-window -t "$WINDOW_ID" || true
     exit "$start_exit"
   fi
 fi
@@ -1165,7 +1170,7 @@ if [[ -d "$CHILD_SKILLS_DIR" ]]; then
 fi
 
 set +e
-"\${PI_CMD[@]}" "$(cat "$PROMPT_FILE")"
+script -qf "$BACKLOG_LOG" -c "\\"\${PI_CMD[@]}\\" \\"$(cat "$PROMPT_FILE")\\""
 exit_code=$?
 set -e
 
@@ -1176,91 +1181,41 @@ if [[ "$exit_code" -eq 0 ]]; then
 else
   echo "[side-agent] Agent exited with code $exit_code."
 fi
-
-read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
-echo
-
-tmux kill-window -t "$WINDOW_ID" || true
 `;
 }
 
-function ensureTmuxReady(): void {
-	const version = run("tmux", ["-V"]);
+function ensureZellijReady(): void {
+	const version = run("zellij", ["--version"]);
 	if (!version.ok) {
-		throw new Error("tmux is required for /agent but was not found or is not working");
+		throw new Error("zellij is required for /agent but was not found or is not working");
 	}
-
-	const session = run("tmux", ["display-message", "-p", "#S"]);
-	if (!session.ok) {
-		throw new Error("/agent must be run from inside tmux (current tmux session was not detected)");
+	if (!process.env.ZELLIJ) {
+		throw new Error("/agent must be run from inside zellij (ZELLIJ env var not set)");
 	}
 }
 
-function getCurrentTmuxSession(): string {
-	const result = runOrThrow("tmux", ["display-message", "-p", "#S"]);
-	const value = result.stdout.trim();
-	if (!value) throw new Error("Failed to determine current tmux session");
+function getCurrentZellijSession(): string {
+	const value = process.env.ZELLIJ_SESSION_NAME;
+	if (!value) throw new Error("Failed to determine current zellij session");
 	return value;
 }
 
-function createTmuxWindow(tmuxSession: string, name: string): { windowId: string; windowIndex: number } {
-	const result = runOrThrow("tmux", [
-		"new-window",
-		"-d",
-		"-t",
-		`${tmuxSession}:`,
-		"-P",
-		"-F",
-		"#{window_id} #{window_index}",
-		"-n",
-		name,
-	]);
-	const out = result.stdout.trim();
-	const [windowId, indexRaw] = out.split(/\s+/);
-	const windowIndex = Number(indexRaw);
-	if (!windowId || !Number.isFinite(windowIndex)) {
-		throw new Error(`Unable to parse tmux window identity: ${out}`);
-	}
-	return { windowId, windowIndex };
+function zellijTabExists(tabName: string): boolean {
+	const result = run("zellij", ["action", "query-tab-names"]);
+	if (!result.ok) return false;
+	return result.stdout.split(/\r?\n/).some(line => line.trim() === tabName);
 }
 
-function tmuxWindowExists(windowId: string): boolean {
-	const result = run("tmux", ["display-message", "-p", "-t", windowId, "#{window_id}"]);
-	return result.ok && result.stdout.trim() === windowId;
+function zellijInterrupt(tabName: string): void {
+	run("zellij", ["action", "go-to-tab-name", tabName]);
+	run("zellij", ["action", "write", "3"]);
+	run("zellij", ["action", "toggle-tab"]);
 }
 
-function tmuxPipePaneToFile(windowId: string, logPath: string): void {
-	runOrThrow("tmux", ["pipe-pane", "-t", windowId, "-o", `cat >> ${shellQuote(logPath)}`]);
-}
-
-function tmuxSendLine(windowId: string, line: string): void {
-	runOrThrow("tmux", ["send-keys", "-t", windowId, line, "C-m"]);
-}
-
-function tmuxInterrupt(windowId: string): void {
-	run("tmux", ["send-keys", "-t", windowId, "C-c"]);
-}
-
-function tmuxSendPrompt(windowId: string, prompt: string): void {
-	const loaded = run("tmux", ["load-buffer", "-"], { input: prompt });
-	if (!loaded.ok) {
-		throw new Error(`Failed to send input to tmux window ${windowId}: ${loaded.stderr || loaded.error || "unknown error"}`);
-	}
-	runOrThrow("tmux", ["paste-buffer", "-d", "-t", windowId]);
-	runOrThrow("tmux", ["send-keys", "-t", windowId, "C-m"]);
-}
-
-function tmuxCaptureTail(windowId: string, lines = 10): string[] {
-	const captured = run("tmux", ["capture-pane", "-p", "-t", windowId, "-S", `-${TMUX_BACKLOG_CAPTURE_LINES}`]);
-	if (!captured.ok) return [];
-	return tailLines(captured.stdout, lines);
-}
-
-/** Capture the currently visible tmux pane content (no scrollback). */
-function tmuxCaptureVisible(windowId: string): string[] {
-	const captured = run("tmux", ["capture-pane", "-p", "-t", windowId]);
-	if (!captured.ok) return [];
-	return splitLines(captured.stdout);
+function zellijSendPrompt(tabName: string, prompt: string): void {
+	runOrThrow("zellij", ["action", "go-to-tab-name", tabName]);
+	runOrThrow("zellij", ["action", "write-chars", prompt + "\n"]);
+	run("zellij", ["action", "toggle-tab"]);
 }
 
 type RefreshRuntimeResult = {
@@ -1290,15 +1245,19 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 		}
 	}
 
-	if (!record.tmuxWindowId) {
+	const launcherPid = record.launcherPid;
+	const launcherAlive = isPidAlive(launcherPid);
+	const tabName = record.zellijTabName;
+	const tabAlive = tabName ? zellijTabExists(tabName) : false;
+
+	if (launcherAlive || tabAlive) {
+		if (record.status === "allocating_worktree" || record.status === "spawning_terminal") {
+			await setRecordStatus(stateRoot, record, "running");
+		}
 		return { removeFromRegistry: false };
 	}
 
-	const live = tmuxWindowExists(record.tmuxWindowId);
-	if (live) {
-		if (record.status === "allocating_worktree" || record.status === "spawning_tmux") {
-			await setRecordStatus(stateRoot, record, "running");
-		}
+	if (!tabName && !launcherPid) {
 		return { removeFromRegistry: false };
 	}
 
@@ -1306,7 +1265,7 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 		record.finishedAt = record.finishedAt ?? nowIso();
 		await setRecordStatus(stateRoot, record, "crashed");
 		if (!record.error) {
-			record.error = "tmux window disappeared before an exit marker was recorded";
+			record.error = "zellij tab disappeared before an exit marker was recorded";
 		}
 		await cleanupWorktreeLockBestEffort(record.worktreePath);
 	}
@@ -1341,15 +1300,6 @@ async function refreshAllAgents(stateRoot: string): Promise<RegistryFile> {
 }
 
 async function getBacklogTail(record: AgentRecord, lines = 10): Promise<string[]> {
-	// Prefer the visible tmux pane — it shows what's actually on screen
-	// and avoids noise from TUI footer redraws that pollute the backlog file.
-	if (record.tmuxWindowId && tmuxWindowExists(record.tmuxWindowId)) {
-		const visible = tmuxCaptureVisible(record.tmuxWindowId);
-		const result = sanitizeBacklogLines(collectRecentBacklogLines(visible, lines));
-		if (result.length > 0) return result;
-	}
-
-	// Fall back to the backlog log file (e.g. tmux window gone but file remains).
 	if (record.logPath && (await fileExists(record.logPath))) {
 		try {
 			const raw = await fs.readFile(record.logPath, "utf8");
@@ -1476,7 +1426,7 @@ function normalizeAgentId(raw: string): string {
 }
 
 async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: StartAgentParams): Promise<StartAgentResult> {
-	ensureTmuxReady();
+	ensureZellijReady();
 
 	const stateRoot = getStateRoot(ctx);
 	const repoRoot = resolveGitRoot(stateRoot);
@@ -1484,7 +1434,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 	const now = nowIso();
 
 	let agentId = "";
-	let spawnedWindowId: string | undefined;
+	let spawnedTabName: string | undefined;
 	let allocatedWorktreePath: string | undefined;
 	let allocatedBranch: string | undefined;
 	let aggregatedWarnings: string[] = [];
@@ -1550,7 +1500,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.promptPath = promptPath;
 			record.logPath = logPath;
 			record.exitFile = exitFile;
-			await setRecordStatus(stateRoot, record, "spawning_tmux");
+			await setRecordStatus(stateRoot, record, "spawning_terminal");
 			record.warnings = [...(record.warnings ?? []), ...worktree.warnings];
 		});
 
@@ -1565,14 +1515,12 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 				await appendKickoffPromptToBacklog(stateRoot, record, kickoff.prompt);
 			});
 		} catch {
-			// Best effort fallback when registry lock/update fails; write directly
-			// to the known backlog path without requiring registry mutation.
 			await appendKickoffPromptToBacklog(
 				stateRoot,
 				{
 					id: agentId,
 					task: params.task,
-					status: "spawning_tmux",
+					status: "spawning_terminal",
 					startedAt: now,
 					updatedAt: nowIso(),
 					runtimeDir,
@@ -1586,14 +1534,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		const modelSpec = resolvedModel.modelSpec;
 		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
-		const tmuxSession = getCurrentTmuxSession();
-		const { windowId, windowIndex } = createTmuxWindow(tmuxSession, `agent-${agentId}`);
-		spawnedWindowId = windowId;
-
-		await updateWorktreeLock(worktree.worktreePath, {
-			tmuxWindowId: windowId,
-			tmuxWindowIndex: windowIndex,
-		});
+		const zellijSession = getCurrentZellijSession();
+		const tabName = `agent-${agentId}`;
+		spawnedTabName = tabName;
 
 		const launchScript = buildLaunchScript({
 			agentId,
@@ -1601,27 +1544,56 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			parentRepoRoot: repoRoot,
 			stateRoot,
 			worktreePath: worktree.worktreePath,
-			tmuxWindowId: windowId,
 			promptPath,
 			exitFile,
 			modelSpec,
 			runtimeDir,
+			backlogPath: logPath,
 		});
 		await atomicWrite(launchScriptPath, launchScript);
 		await fs.chmod(launchScriptPath, 0o755);
 
-		tmuxPipePaneToFile(windowId, logPath);
-		// Run cd in the interactive pane shell first so Ctrl+Z in child Pi drops
-		// back to the child worktree prompt (not the parent worktree).
-		tmuxSendLine(windowId, `cd ${shellQuote(worktree.worktreePath)}`);
-		tmuxSendLine(windowId, `bash ${shellQuote(launchScriptPath)}`);
+		const layoutPath = join(runtimeDir, "layout.kdl");
+		const kdlQuote = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+		const layoutContent = `layout {\n    pane command="bash" {\n        args ${kdlQuote(launchScriptPath)}\n        cwd ${kdlQuote(worktree.worktreePath)}\n    }\n}\n`;
+		await atomicWrite(layoutPath, layoutContent);
+
+		runOrThrow("zellij", ["action", "new-tab", "-n", tabName, "-l", layoutPath]);
+		run("zellij", ["action", "toggle-tab"]);
+
+		await updateWorktreeLock(worktree.worktreePath, {
+			zellijTabName: tabName,
+		});
+
+		let zellijPaneId: string | undefined;
+		const paneIdFile = join(runtimeDir, "pane.id");
+		const launcherPidFile = join(runtimeDir, "launcher.pid");
+		let launcherPid: number | undefined;
+		for (let attempt = 0; attempt < 10; attempt++) {
+			await sleep(200);
+			if (await fileExists(paneIdFile)) {
+				try {
+					const raw = await fs.readFile(paneIdFile, "utf8");
+					const trimmed = raw.trim();
+					if (trimmed && trimmed !== "unknown") zellijPaneId = trimmed;
+				} catch {}
+			}
+			if (await fileExists(launcherPidFile)) {
+				try {
+					const raw = await fs.readFile(launcherPidFile, "utf8");
+					launcherPid = parseOptionalPid(raw.trim());
+				} catch {}
+			}
+			if (zellijPaneId || launcherPid) break;
+		}
 
 		await mutateRegistry(stateRoot, async (registry) => {
 			const record = registry.agents[agentId];
 			if (!record) return;
-			record.tmuxSession = tmuxSession;
-			record.tmuxWindowId = windowId;
-			record.tmuxWindowIndex = windowIndex;
+			record.zellijSession = zellijSession;
+			record.zellijPaneId = zellijPaneId;
+			record.zellijTabName = tabName;
+			record.launcherPid = launcherPid;
 			record.worktreePath = worktree.worktreePath;
 			record.branch = worktree.branch;
 			record.runtimeDir = runtimeDir;
@@ -1635,8 +1607,8 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		const started: StartAgentResult = {
 			id: agentId,
-			tmuxWindowId: windowId,
-			tmuxWindowIndex: windowIndex,
+			zellijPaneId,
+			zellijTabName: tabName,
 			worktreePath: worktree.worktreePath,
 			branch: worktree.branch,
 			warnings: aggregatedWarnings,
@@ -1646,8 +1618,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		return started;
 	} catch (err) {
-		if (spawnedWindowId) {
-			run("tmux", ["kill-window", "-t", spawnedWindowId]);
+		if (spawnedTabName && zellijTabExists(spawnedTabName)) {
+			run("zellij", ["action", "go-to-tab-name", spawnedTabName]);
+			run("zellij", ["action", "close-tab"]);
 		}
 
 		if (agentId) {
@@ -1694,8 +1667,8 @@ async function agentCheckPayload(stateRoot: string, agentId: string): Promise<Re
 		agent: {
 			id: record.id,
 			status: record.status,
-			tmuxWindowId: record.tmuxWindowId,
-			tmuxWindowIndex: record.tmuxWindowIndex,
+			zellijPaneId: record.zellijPaneId,
+			zellijTabName: record.zellijTabName,
 			worktreePath: record.worktreePath,
 			branch: record.branch,
 			task: summarizeTask(record.task),
@@ -1719,25 +1692,23 @@ async function sendToAgent(stateRoot: string, agentId: string, prompt: string): 
 	if (!record) {
 		return { ok: false, message: `Unknown agent id: ${normalizedId}` };
 	}
-	if (!record.tmuxWindowId) {
-		return { ok: false, message: `Agent ${normalizedId} has no tmux window id recorded` };
+	if (!record.zellijTabName) {
+		return { ok: false, message: `Agent ${normalizedId} has no zellij tab name recorded` };
 	}
-	if (!tmuxWindowExists(record.tmuxWindowId)) {
-		return { ok: false, message: `Agent ${normalizedId} tmux window is not active` };
+	if (!zellijTabExists(record.zellijTabName)) {
+		return { ok: false, message: `Agent ${normalizedId} zellij tab is not active` };
 	}
 
 	let payload = prompt;
 	if (payload.startsWith("!")) {
-		tmuxInterrupt(record.tmuxWindowId);
+		zellijInterrupt(record.zellijTabName);
 		payload = payload.slice(1).trimStart();
 		if (payload.length > 0) {
-			// Brief pause so Pi can finish handling the interrupt and return to an
-			// interactive prompt before the follow-up text lands in the pane.
 			await sleep(300);
 		}
 	}
 	if (payload.length > 0) {
-		tmuxSendPrompt(record.tmuxWindowId, payload);
+		zellijSendPrompt(record.zellijTabName, payload);
 	}
 
 	await mutateRegistry(stateRoot, async (registry) => {
@@ -1908,7 +1879,7 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 	for (const record of agents) {
 		const currentSnapshot: AgentStatusSnapshot = {
 			status: record.status,
-			tmuxWindowIndex: record.tmuxWindowIndex,
+			zellijTabName: record.zellijTabName,
 		};
 		next.set(record.id, currentSnapshot);
 
@@ -1918,7 +1889,7 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 			id: record.id,
 			fromStatus: previousSnapshot.status,
 			toStatus: record.status,
-			tmuxWindowIndex: record.tmuxWindowIndex ?? previousSnapshot.tmuxWindowIndex,
+			zellijTabName: record.zellijTabName ?? previousSnapshot.zellijTabName,
 		});
 	}
 
@@ -1930,7 +1901,7 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 				id: agentId,
 				fromStatus: previousSnapshot.status,
 				toStatus: "done",
-				tmuxWindowIndex: previousSnapshot.tmuxWindowIndex,
+				zellijTabName: previousSnapshot.zellijTabName,
 			});
 		}
 	}
@@ -1953,10 +1924,10 @@ function formatLabelPrefix(prefix: string, theme?: ThemeForeground): string {
 }
 
 function formatStatusTransitionMessage(transition: StatusTransitionNotice, theme?: ThemeForeground): string {
-	const win = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex})` : "";
+	const tab = transition.zellijTabName ? ` (tab: ${transition.zellijTabName})` : "";
 	const from = formatStatusWord(transition.fromStatus, theme);
 	const to = formatStatusWord(transition.toStatus, theme);
-	return `side-agent ${transition.id}: ${from} -> ${to}${win}`;
+	return `side-agent ${transition.id}: ${from} -> ${to}${tab}`;
 }
 
 function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transitions: StatusTransitionNotice[]): void {
@@ -1973,7 +1944,7 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transiti
 					agentId: transition.id,
 					fromStatus: transition.fromStatus,
 					toStatus: transition.toStatus,
-					tmuxWindowIndex: transition.tmuxWindowIndex,
+					zellijTabName: transition.zellijTabName,
 					emittedAt: Date.now(),
 				},
 			},
@@ -1990,8 +1961,8 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transiti
 }
 
 function emitKickoffPromptMessage(pi: ExtensionAPI, started: StartAgentResult): void {
-	const win = started.tmuxWindowIndex !== undefined ? ` (tmux #${started.tmuxWindowIndex})` : "";
-	const content = `side-agent ${started.id}: kickoff prompt${win}\n\n${started.prompt}`;
+	const tab = started.zellijTabName ? ` (tab: ${started.zellijTabName})` : "";
+	const content = `side-agent ${started.id}: kickoff prompt${tab}\n\n${started.prompt}`;
 	pi.sendMessage(
 		{
 			customType: PROMPT_UPDATE_MESSAGE_TYPE,
@@ -1999,8 +1970,8 @@ function emitKickoffPromptMessage(pi: ExtensionAPI, started: StartAgentResult): 
 			display: false,
 			details: {
 				agentId: started.id,
-				tmuxWindowId: started.tmuxWindowId,
-				tmuxWindowIndex: started.tmuxWindowIndex,
+				zellijPaneId: started.zellijPaneId,
+				zellijTabName: started.zellijTabName,
 				worktreePath: started.worktreePath,
 				branch: started.branch,
 				prompt: started.prompt,
@@ -2042,8 +2013,8 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 	const theme = ctx.ui.theme;
 	const line = visible
 		.map((record) => {
-			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
-			const entry = `${record.id}:${statusShort(record.status)}${win}`;
+			const tab = record.zellijTabName ? `[${record.zellijTabName}]` : "";
+			const entry = `${record.id}:${statusShort(record.status)}${tab}`;
 			return theme.fg(statusColorRole(record.status), entry);
 		})
 		.join(" ");
@@ -2077,7 +2048,7 @@ function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
 export default function sideAgentsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("agent", {
-		description: "Spawn a background child agent in its own tmux window/worktree: /agent [-model <provider/id>] <task>",
+		description: "Spawn a background child agent in its own zellij tab/worktree: /agent [-model <provider/id>] <task>",
 		handler: async (args, ctx) => {
 			const parsed = parseAgentCommandArgs(args);
 			if (!parsed.task) {
@@ -2095,7 +2066,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 				const lines = [
 					`id: ${started.id}`,
-					`tmux window: ${started.tmuxWindowId} (#${started.tmuxWindowIndex})`,
+					`zellij tab: ${started.zellijTabName}${started.zellijPaneId ? ` (pane: ${started.zellijPaneId})` : ""}`,
 					`worktree: ${started.worktreePath}`,
 					`branch: ${started.branch}`,
 				];
@@ -2136,13 +2107,13 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			} else {
 				const theme = ctx.hasUI ? ctx.ui.theme : undefined;
 				for (const [index, record] of records.entries()) {
-					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
+					const tab = record.zellijTabName ?? "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
 					const statusWord = formatStatusWord(record.status, theme);
-					const winPrefix = formatLabelPrefix("win:", theme);
+					const tabPrefix = formatLabelPrefix("tab:", theme);
 					const worktreePrefix = formatLabelPrefix("worktree:", theme);
 					const taskPrefix = formatLabelPrefix("task:", theme);
-					lines.push(`${record.id}  ${statusWord}  ${winPrefix}${win}  ${worktreePrefix}${worktreeName}`);
+					lines.push(`${record.id}  ${statusWord}  ${tabPrefix}${tab}  ${worktreePrefix}${worktreeName}`);
 					lines.push(`  ${taskPrefix} ${summarizeTask(record.task)}`);
 					if (record.error) lines.push(`  error: ${record.error}`);
 					if (record.status === "failed" || record.status === "crashed") {
@@ -2194,7 +2165,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					"Reclaim orphan worktree locks?",
 					[
 						`Remove ${orphanLocks.reclaimable.length} orphan worktree lock(s)?`,
-						"Only lock files with no tracked registry agent and no live pid/tmux signal are included.",
+						"Only lock files with no tracked registry agent and no live pid/tab signal are included.",
 						"",
 						...preview,
 					].join("\n"),
@@ -2225,7 +2196,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Returns { ok: true, id, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background side agent in zellij/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Returns { ok: true, id, task, zellijPaneId, zellijTabName, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
@@ -2248,8 +2219,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 									ok: true,
 									id: started.id,
 									task: params.description.length > 200 ? params.description.slice(0, 200) + "…" : params.description,
-									tmuxWindowId: started.tmuxWindowId,
-									tmuxWindowIndex: started.tmuxWindowIndex,
+									zellijPaneId: started.zellijPaneId,
+									zellijTabName: started.zellijTabName,
 									worktreePath: started.worktreePath,
 									branch: started.branch,
 									warnings: started.warnings,
@@ -2272,7 +2243,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-check",
 		label: "Agent Check",
 		description:
-			"Check a given side agent status and return compact recent output. Returns { ok: true, agent: { id, status, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. backlog is sanitized/truncated for LLM safety; task is a compact preview. Statuses: allocating_worktree | spawning_tmux | running | waiting_user | failed | crashed. Agents that exit with code 0 are auto-removed from registry.",
+			"Check a given side agent status and return compact recent output. Returns { ok: true, agent: { id, status, zellijPaneId, zellijTabName, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. backlog is sanitized/truncated for LLM safety; task is a compact preview. Statuses: allocating_worktree | spawning_terminal | running | waiting_user | failed | crashed. Agents that exit with code 0 are auto-removed from registry.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
 		}),
@@ -2316,7 +2287,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-send",
 		label: "Agent Send",
 		description:
-			"Send a steering/follow-up prompt to a child agent's tmux pane. Returns { ok: boolean, message: string }.",
+			"Send a steering/follow-up prompt to a child agent's zellij pane. Returns { ok: boolean, message: string }.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
 			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first instead of organic steering, '/' for slash commands like /quit)" }),

@@ -45,9 +45,12 @@ Paths (relative to state root):
 - Registry lock: `.pi/side-agents/registry.lock`
 - Runtime per agent: `.pi/side-agents/runtime/<agentId>/`
   - `kickoff.md` — kickoff prompt text
-  - `backlog.log` — tmux pane output (via `tmux pipe-pane`)
-  - `exit.json` — exit marker written by launcher (`{ exitCode, finishedAt }`)
-  - `launch.sh` — generated launcher script (what tmux runs)
+  - `backlog.log` — transcript captured by `script -qf` while Pi runs
+  - `exit.json` — exit marker written by launcher (`{ exitCode, finishedAt, launcherPid }`)
+  - `launch.sh` — generated launcher script (what zellij runs)
+  - `layout.kdl` — per-agent zellij layout file used for tab creation
+  - `pane.id` — best-effort record of `ZELLIJ_PANE_ID`
+  - `launcher.pid` — launcher shell pid for crash detection
 - Runtime archive (when reusing an agent id): `.pi/side-agents/runtime-archive/<agentId>/<stamp>/...`
 
 Worktree pool (sibling directories of repo root):
@@ -134,14 +137,14 @@ Example (fields may evolve):
   "pid": 12345,
   "branch": "side-agent/fix-auth-leak",
   "startedAt": "2026-03-03T02:58:00.000Z",
-  "tmuxWindowId": "@19",
-  "tmuxWindowIndex": 3
+  "zellijTabName": "agent-fix-auth-leak"
 }
 ```
 
 Notes:
 
 - `sessionId` is initially written as the parent session id, then updated by the **child** session to its own session id once linked.
+- `pid` starts as the parent process pid that reserved the worktree; runtime metadata may add launcher-specific signals later.
 - Orphan/stale lockfiles are never auto-deleted; `/agents` can offer a **user-confirmed** reclaim.
 
 ### 5.5 Replicating `.pi/side-agent-*` into worktrees
@@ -155,21 +158,21 @@ This is how child worktrees discover:
 - `.pi/side-agent-skills/` (child-only skill directory)
 - optional `.pi/side-agent-bootstrap.sh`
 
-## 6) Tmux orchestrator + launcher
+## 6) Zellij orchestrator + launcher
 
 ### 6.1 Preconditions
 
-- `tmux` must be installed.
-- `/agent` must be executed from within a tmux session.
+- `zellij` must be installed.
+- `/agent` must be executed from within a zellij session.
+- The current session name must be available via `ZELLIJ_SESSION_NAME`.
 
-### 6.2 Window lifecycle
+### 6.2 Tab lifecycle
 
-- A new window is created in the **current tmux session**, named `agent-<agentId>`.
-- The tmux pane is piped into `backlog.log`.
-- The window runs the generated `launch.sh`.
-- On Pi exit, the launcher writes `exit.json`, prompts:
-  - `Press any key to close this tmux window…`
-  and then kills the tmux window.
+- A new tab is created in the **current zellij session**, named `agent-<agentId>`.
+- The tab is created from a generated `layout.kdl` that launches `bash <runtime>/launch.sh` with the child worktree as `cwd`.
+- After creating the tab, the parent toggles back to its previous tab.
+- The launcher records `ZELLIJ_PANE_ID` and its own pid for parent-side tracking.
+- When the launcher process exits, zellij closes the pane/tab naturally; there is no extra “press any key to close” prompt.
 
 ### 6.3 Child environment variables
 
@@ -209,9 +212,9 @@ When the parent (or tools) refresh an agent record:
   - marks status `done` for exit code `0`, else `failed`
   - removes `.pi/active.lock`
   - **auto-prunes** successful (`exitCode=0`) agents from registry
-- If the tmux window is gone but no exit marker was recorded:
+- If both the tracked launcher pid and zellij tab are gone but no exit marker was recorded:
   - marks `crashed`
-  - sets `error: "tmux window disappeared before an exit marker was recorded"` if missing
+  - sets `error: "zellij tab disappeared before an exit marker was recorded"` if missing
   - removes `.pi/active.lock`
 
 ### 7.3 Statuses
@@ -219,11 +222,11 @@ When the parent (or tools) refresh an agent record:
 Statuses currently used by the core extension:
 
 - `allocating_worktree` — parent is reserving record / picking a slot
-- `spawning_tmux` — runtime dir + tmux window + launcher are being set up
+- `spawning_terminal` — runtime dir + zellij tab + launcher are being set up
 - `running` — child is actively producing output
 - `waiting_user` — child is idle and waiting for input (set from Pi lifecycle events in the child)
 - `failed` — agent exited non-zero (exit marker recorded)
-- `crashed` — tmux window disappeared without an exit marker
+- `crashed` — zellij tab disappeared without an exit marker
 - `done` — internal terminal success state; record is usually immediately pruned
 
 Statuses reserved for future / project-specific integration:
@@ -239,11 +242,11 @@ In UI sessions, the extension polls every ~2.5s and sets a statusline segment un
 
 Format (approx):
 
-- `<id>:<short>@<tmuxWindowIndex>`
+- `<id>:<short>[<zellijTabName>]`
 
 Example:
 
-- `fix-auth-leak:wait@3 add-auth-tests:run@5`
+- `fix-auth-leak:wait[agent-fix-auth-leak] add-auth-tests:run[agent-add-auth-tests]`
 
 ## 9) Child lifecycle scripts (project-local)
 
@@ -271,7 +274,7 @@ Input:
 Output (success):
 
 ```json
-{ "ok": true, "id": "fix-auth-leak", "tmuxWindowId": "@19", "tmuxWindowIndex": 3, "worktreePath": "...", "branch": "side-agent/fix-auth-leak", "warnings": [] }
+{ "ok": true, "id": "fix-auth-leak", "zellijPaneId": "5", "zellijTabName": "agent-fix-auth-leak", "worktreePath": "...", "branch": "side-agent/fix-auth-leak", "warnings": [] }
 ```
 
 Notes:
@@ -317,3 +320,4 @@ Prefix rules:
 
 - `!` — send Ctrl+C first; if there is more text after `!`, wait ~300ms, then send it.
 - `/` — forwarded as-is; Pi interprets it as a slash command.
+- Delivery targets the agent’s tracked zellij tab name.

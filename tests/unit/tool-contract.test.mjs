@@ -2,7 +2,7 @@
  * Tool contract unit tests for pi-side-agents.
  *
  * These tests validate the JSON-shape contracts and pure-function behavior of
- * the agent control tools without requiring a live Pi process, real tmux, or
+ * the agent control tools without requiring a live Pi process, real zellij, or
  * real git worktrees.  They complement the full integration suite at
  * tests/integration/side-agents.integration.test.mjs.
  *
@@ -190,8 +190,8 @@ async function cleanupWorktreeLockBestEffort(worktreePath) {
  * Re-implementation of status-transition collection used by status polling.
  * Returns the next snapshot map and the transitions that should be emitted.
  *
- * @param {Map<string, { status: string, tmuxWindowIndex?: number }> | undefined} previous
- * @param {Array<{ id: string, status: string, tmuxWindowIndex?: number }>} agents
+ * @param {Map<string, { status: string, zellijTabName?: string }> | undefined} previous
+ * @param {Array<{ id: string, status: string, zellijTabName?: string }>} agents
  */
 function collectStatusTransitions(previous, agents) {
 	const next = new Map();
@@ -200,7 +200,7 @@ function collectStatusTransitions(previous, agents) {
 	for (const record of agents) {
 		const current = {
 			status: record.status,
-			tmuxWindowIndex: record.tmuxWindowIndex,
+			zellijTabName: record.zellijTabName,
 		};
 		next.set(record.id, current);
 
@@ -210,7 +210,7 @@ function collectStatusTransitions(previous, agents) {
 			id: record.id,
 			fromStatus: prev.status,
 			toStatus: record.status,
-			tmuxWindowIndex: record.tmuxWindowIndex ?? prev.tmuxWindowIndex,
+			zellijTabName: record.zellijTabName ?? prev.zellijTabName,
 		});
 	}
 
@@ -222,7 +222,7 @@ function collectStatusTransitions(previous, agents) {
 				id,
 				fromStatus: prev.status,
 				toStatus: "done",
-				tmuxWindowIndex: prev.tmuxWindowIndex,
+				zellijTabName: prev.zellijTabName,
 			});
 		}
 	}
@@ -263,7 +263,7 @@ test("isTerminalStatus — done/failed/crashed are terminal", () => {
 test("isTerminalStatus — running/waiting/finishing are non-terminal", () => {
 	const nonTerminal = [
 		"allocating_worktree",
-		"spawning_tmux",
+		"spawning_terminal",
 		"starting",
 		"running",
 		"waiting_user",
@@ -351,7 +351,7 @@ test("sanitizeBacklogLines — strips ANSI/control sequences and truncates lines
 });
 
 test("collectRecentBacklogLines — extracts content from visible pane with footer at bottom", () => {
-	// A real tmux visible pane has ~50 lines of content with a 3-4 line TUI
+	// A real zellij visible pane has ~50 lines of content with a 3-4 line TUI
 	// footer at the very bottom.  When requesting 10 lines, we should get
 	// actual content mixed with just a few footer lines — much better than
 	// the old backlog.log approach which was 100% footer redraws.
@@ -398,7 +398,7 @@ test("collectRecentBacklogLines — extracts content from visible pane with foot
 });
 
 test("collectRecentBacklogLines — visible pane is bounded unlike backlog.log", () => {
-	// The key improvement of using tmux capture-pane (visible) over backlog.log:
+	// The key improvement of using zellij visible pane capture over backlog.log:
 	// backlog.log accumulates footer redraws unboundedly — thousands of lines of
 	// pure footer noise.  The visible pane is bounded to one screen (~50 lines)
 	// so even in the worst case, footer lines are limited and real content from
@@ -451,17 +451,17 @@ test("summarizeTask — collapses whitespace and truncates", () => {
 
 test("collectStatusTransitions — first snapshot emits no transitions", () => {
 	const { next, transitions } = collectStatusTransitions(undefined, [
-		{ id: "alpha", status: "running", tmuxWindowIndex: 7 },
+		{ id: "alpha", status: "running", zellijTabName: "agent-alpha" },
 	]);
 
 	assert.equal(next.get("alpha")?.status, "running");
-	assert.equal(next.get("alpha")?.tmuxWindowIndex, 7);
+	assert.equal(next.get("alpha")?.zellijTabName, "agent-alpha");
 	assert.deepEqual(transitions, []);
 });
 
-test("collectStatusTransitions — changed status emits transition with tmux fallback", () => {
+test("collectStatusTransitions — changed status emits transition with zellijTabName fallback", () => {
 	const previous = new Map([
-		["alpha", { status: "running", tmuxWindowIndex: 17 }],
+		["alpha", { status: "running", zellijTabName: "agent-alpha" }],
 	]);
 
 	const { transitions } = collectStatusTransitions(previous, [{ id: "alpha", status: "waiting_user" }]);
@@ -470,14 +470,14 @@ test("collectStatusTransitions — changed status emits transition with tmux fal
 			id: "alpha",
 			fromStatus: "running",
 			toStatus: "waiting_user",
-			tmuxWindowIndex: 17,
+			zellijTabName: "agent-alpha",
 		},
 	]);
 });
 
 test("collectStatusTransitions — removed non-terminal agent emits synthetic -> done transition", () => {
 	const previous = new Map([
-		["alpha", { status: "waiting_user", tmuxWindowIndex: 17 }],
+		["alpha", { status: "waiting_user", zellijTabName: "agent-alpha" }],
 	]);
 
 	const { transitions } = collectStatusTransitions(previous, []);
@@ -486,15 +486,15 @@ test("collectStatusTransitions — removed non-terminal agent emits synthetic ->
 			id: "alpha",
 			fromStatus: "waiting_user",
 			toStatus: "done",
-			tmuxWindowIndex: 17,
+			zellijTabName: "agent-alpha",
 		},
 	]);
 });
 
 test("collectStatusTransitions — removed terminal agent does not emit synthetic done", () => {
 	const previous = new Map([
-		["failed-agent", { status: "failed", tmuxWindowIndex: 3 }],
-		["crashed-agent", { status: "crashed", tmuxWindowIndex: 4 }],
+		["failed-agent", { status: "failed", zellijTabName: "agent-failed" }],
+		["crashed-agent", { status: "crashed", zellijTabName: "agent-crashed" }],
 	]);
 
 	const { transitions } = collectStatusTransitions(previous, []);
@@ -542,8 +542,8 @@ test("agent-start success shape must include ok: true and task", () => {
 		ok: true,
 		id: "a-0001",
 		task: "refactor auth module",
-		tmuxWindowId: "@5",
-		tmuxWindowIndex: 5,
+		zellijPaneId: "5",
+		zellijTabName: "agent-a-0001",
 		worktreePath: "/tmp/repo-agent-worktree-0001",
 		branch: "side-agent/a-0001",
 		warnings: [],
@@ -552,8 +552,8 @@ test("agent-start success shape must include ok: true and task", () => {
 	assert.strictEqual(exampleSuccess.ok, true, "success response must have ok: true");
 	assert.ok(typeof exampleSuccess.id === "string", "id must be a string");
 	assert.ok(typeof exampleSuccess.task === "string", "task must be a string");
-	assert.ok(typeof exampleSuccess.tmuxWindowId === "string", "tmuxWindowId must be a string");
-	assert.ok(typeof exampleSuccess.tmuxWindowIndex === "number", "tmuxWindowIndex must be a number");
+	assert.ok(typeof exampleSuccess.zellijPaneId === "string", "zellijPaneId must be a string");
+	assert.ok(typeof exampleSuccess.zellijTabName === "string", "zellijTabName must be a string");
 	assert.ok(typeof exampleSuccess.worktreePath === "string", "worktreePath must be a string");
 	assert.ok(typeof exampleSuccess.branch === "string", "branch must be a string");
 	assert.ok(Array.isArray(exampleSuccess.warnings), "warnings must be an array");
@@ -582,7 +582,7 @@ test("agent-start task field — exactly 200 chars is not truncated", () => {
 });
 
 test("agent-start error shape must include ok: false and error string", () => {
-	const exampleError = { ok: false, error: "tmux is not available" };
+	const exampleError = { ok: false, error: "zellij is not available" };
 	assert.strictEqual(exampleError.ok, false);
 	assert.ok(typeof exampleError.error === "string");
 });
@@ -593,8 +593,8 @@ test("agent-check success shape", () => {
 		agent: {
 			id: "a-0001",
 			status: "running",
-			tmuxWindowId: "@5",
-			tmuxWindowIndex: 5,
+			zellijPaneId: "5",
+			zellijTabName: "agent-a-0001",
 			worktreePath: "/tmp/repo-agent-worktree-0001",
 			branch: "side-agent/a-0001",
 			task: "refactor auth module",
@@ -620,7 +620,7 @@ test("agent-send success shape", () => {
 });
 
 test("agent-send failure shape", () => {
-	const exampleFailure = { ok: false, message: "Agent a-9999 tmux window is not active" };
+	const exampleFailure = { ok: false, message: "Agent a-9999 zellij pane is not active" };
 	assert.strictEqual(exampleFailure.ok, false);
 	assert.ok(typeof exampleFailure.message === "string");
 });

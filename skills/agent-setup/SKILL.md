@@ -296,5 +296,5 @@ Explicitly remind the user that `.pi/side-agent-*` files are local runtime setup
 
 - Backup reference for future diffs
 - Start an agent: `/agent <task description>`
-- Watch status: statusline shows active agents, ...@<number> is the tmux window to switch to; `/agents` lists all
+- Watch status: statusline shows active agents, `[agent-…]` is the zellij tab to switch to; `/agents` lists all
 - Ask you to set up and manage a flock of multiple side agents on your own to solve a task (you have the tools)

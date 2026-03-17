@@ -144,30 +144,51 @@ async function ensureLoginShellPiCommand() {
 	};
 }
 
-function tmux(harness, args, options = {}) {
-	return run("tmux", ["-S", harness.tmuxSocket, ...args], options);
+function zellij(harness, args, options = {}) {
+	// Use --session to target the specific zellij session from outside
+	const [subcommand, ...rest] = args;
+	if (subcommand === "action") {
+		return run("zellij", ["--session", harness.sessionName, "action", ...rest], options);
+	}
+	return run("zellij", ["--session", harness.sessionName, ...args], options);
 }
 
-async function capturePane(harness, target, lines = 400) {
-	const result = tmux(harness, ["capture-pane", "-p", "-t", target, "-S", `-${lines}`]);
-	return result.stdout;
+async function capturePane(harness, tabName, lines = 400) {
+	const dumpFile = join(harness.rootDir, `dump-${Date.now()}-${Math.random().toString(16).slice(2, 6)}.txt`);
+	if (tabName) {
+		zellij(harness, ["action", "go-to-tab-name", tabName], { allowFailure: true });
+	}
+	zellij(harness, ["action", "dump-screen", dumpFile], { allowFailure: true });
+	try {
+		const raw = await readFile(dumpFile, "utf8");
+		return raw;
+	} catch {
+		return "";
+	}
 }
 
 async function captureParent(harness, lines = 500) {
-	return capturePane(harness, harness.parentTarget, lines);
+	return capturePane(harness, harness.parentTabName, lines);
 }
 
-function sendLiteral(harness, target, text) {
-	tmux(harness, ["send-keys", "-t", target, "-l", text]);
+function sendLiteral(harness, tabName, text) {
+	if (tabName) {
+		zellij(harness, ["action", "go-to-tab-name", tabName], { allowFailure: true });
+	}
+	zellij(harness, ["action", "write-chars", text]);
 }
 
-function sendEnter(harness, target) {
-	tmux(harness, ["send-keys", "-t", target, "C-m"]);
+function sendEnter(harness, tabName) {
+	if (tabName) {
+		zellij(harness, ["action", "go-to-tab-name", tabName], { allowFailure: true });
+	}
+	// 13 = Enter key
+	zellij(harness, ["action", "write", "13"]);
 }
 
 async function sendParentCommand(harness, command) {
-	sendLiteral(harness, harness.parentTarget, command);
-	sendEnter(harness, harness.parentTarget);
+	sendLiteral(harness, harness.parentTabName, command);
+	sendEnter(harness, harness.parentTabName);
 	await sleep(120);
 }
 
@@ -215,7 +236,7 @@ async function waitForSpawnedAgent(harness, id, timeoutMs = 90_000) {
 		`spawned agent metadata for ${id}`,
 		async () => {
 			const agent = await waitForAgent(harness, id, { timeoutMs: 5_000 });
-			if (!agent.tmuxWindowId) return false;
+			if (!agent.zellijTabName) return false;
 			if (!agent.worktreePath) return false;
 			if (!agent.runtimeDir) return false;
 			if (!agent.promptPath) return false;
@@ -232,7 +253,7 @@ async function snapshotAgentIds(harness) {
 }
 
 function hasSpawnMetadata(agent) {
-	return Boolean(agent?.tmuxWindowId && agent?.worktreePath && agent?.runtimeDir && agent?.promptPath && agent?.logPath);
+	return Boolean(agent?.zellijTabName && agent?.worktreePath && agent?.runtimeDir && agent?.promptPath && agent?.logPath);
 }
 
 async function waitForNewSpawnedAgent(harness, previousIds, timeoutMs = 90_000) {
@@ -274,13 +295,10 @@ async function readWorktreeLock(worktreePath) {
 	return JSON.parse(await readFile(lockPath, "utf8"));
 }
 
-function windowExists(harness, windowId) {
-	const result = tmux(
-		harness,
-		["display-message", "-p", "-t", windowId, "#{window_id}"],
-		{ allowFailure: true },
-	);
-	return result.status === 0 && result.stdout.trim() === windowId;
+function tabExists(harness, tabName) {
+	const result = zellij(harness, ["action", "query-tab-names"], { allowFailure: true });
+	if (result.status !== 0) return false;
+	return result.stdout.split(/\r?\n/).some((line) => line.trim() === tabName);
 }
 
 async function waitForBacklogContains(harness, agentId, needle, timeoutMs = 90_000) {
@@ -463,90 +481,55 @@ async function callAgentSendTool(harness, id, prompt, timeoutMs = 90_000) {
 	return callToolViaPrompt(harness, "agent-send", { id, prompt }, { timeoutMs, retries: 3 });
 }
 
-async function readWindowIdFromLaunchScript(harness, agentId) {
-	const launchPath = join(harness.repoRoot, ".pi", "side-agents", "runtime", agentId, "launch.sh");
-	if (!(await exists(launchPath))) return undefined;
-	const raw = await readFile(launchPath, "utf8").catch(() => "");
-	const match = raw.match(/(?:^|\n)WINDOW_ID=(?:'([^']+)'|"([^"]+)"|([^\s\n]+))/);
-	return match?.[1] || match?.[2] || match?.[3];
-}
-
-async function resolveChildWindowId(harness, agentId) {
+async function resolveChildTabName(harness, agentId) {
 	const registry = await readRegistry(harness);
-	const fromRegistry = registry.agents?.[agentId]?.tmuxWindowId;
+	const fromRegistry = registry.agents?.[agentId]?.zellijTabName;
 	if (typeof fromRegistry === "string" && fromRegistry.length > 0) {
 		return fromRegistry;
 	}
 
-	const fromLaunchScript = await readWindowIdFromLaunchScript(harness, agentId);
-	if (fromLaunchScript) {
-		return fromLaunchScript;
-	}
-
-	const list = tmux(harness, ["list-windows", "-F", "#{window_id} #{window_name}"], { allowFailure: true });
-	if (list.status !== 0) {
-		return undefined;
-	}
-	for (const line of list.stdout.split(/\r?\n/)) {
+	// Fallback: look for a tab whose name matches the expected pattern
+	const result = zellij(harness, ["action", "query-tab-names"], { allowFailure: true });
+	if (result.status !== 0) return undefined;
+	for (const line of result.stdout.split(/\r?\n/)) {
 		const trimmed = line.trim();
-		if (!trimmed) continue;
-		const [windowId, ...nameParts] = trimmed.split(/\s+/);
-		if (nameParts.join(" ") === `agent-${agentId}`) {
-			return windowId;
+		if (trimmed.includes(agentId)) {
+			return trimmed;
 		}
 	}
 
 	return undefined;
 }
 
-async function closeChildWindowAfterPrompt(harness, agentId, windowIdHint) {
-	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
-
+async function waitForChildTabClosed(harness, agentId, tabNameHint) {
 	const terminalRecord = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 }).catch(
 		() => undefined,
 	);
-	const windowId = windowIdHint || terminalRecord?.tmuxWindowId || (await resolveChildWindowId(harness, agentId));
-	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId (registry/launch.sh fallback)`);
+	const tabName = tabNameHint || terminalRecord?.zellijTabName || (await resolveChildTabName(harness, agentId));
 
-	if (!windowExists(harness, windowId)) {
+	if (!tabName || !tabExists(harness, tabName)) {
+		// Tab already gone — zellij closes the tab when the pane process exits
 		return;
 	}
 
-	const childPaneRaw = await capturePane(harness, windowId, 500);
-	const childPane = normalizeScreen(childPaneRaw);
-	assert.ok(
-		childPane.includes("Press any key to close this tmux window"),
-		"child pane should show press-any-key prompt before close",
-	);
-
-	const paneTargetResult = tmux(
-		harness,
-		["display-message", "-p", "-t", windowId, "#{pane_id}"],
-		{ allowFailure: true },
-	);
-	const keyTarget = paneTargetResult.status === 0 ? paneTargetResult.stdout.trim() || windowId : windowId;
-
-	tmux(harness, ["send-keys", "-t", keyTarget, "-l", "x"], { allowFailure: true });
-	tmux(harness, ["send-keys", "-t", keyTarget, "C-m"], { allowFailure: true });
+	// In zellij, tabs close automatically when the child process exits.
+	// Wait for the tab to disappear.
 	try {
 		await waitFor(
-			`tmux window ${windowId} to close`,
-			async () => {
-				if (!windowExists(harness, windowId)) return true;
-				tmux(harness, ["send-keys", "-t", keyTarget, "-l", "x"], { allowFailure: true });
-				tmux(harness, ["send-keys", "-t", keyTarget, "C-m"], { allowFailure: true });
-				return false;
-			},
+			`zellij tab "${tabName}" to close`,
+			async () => !tabExists(harness, tabName),
 			{ timeoutMs: 30_000, intervalMs: 1_500 },
 		);
 	} catch (error) {
-		tmux(harness, ["kill-window", "-t", windowId], { allowFailure: true });
+		// Force-close the tab if it didn't close on its own
+		zellij(harness, ["action", "go-to-tab-name", tabName], { allowFailure: true });
+		zellij(harness, ["action", "close-tab"], { allowFailure: true });
 		await waitFor(
-			`forced close of tmux window ${windowId}`,
-			async () => !windowExists(harness, windowId),
+			`forced close of zellij tab "${tabName}"`,
+			async () => !tabExists(harness, tabName),
 			{ timeoutMs: 10_000, intervalMs: 250 },
 		);
-		if (windowExists(harness, windowId)) {
+		if (tabExists(harness, tabName)) {
 			throw error;
 		}
 	}
@@ -557,8 +540,8 @@ async function createHarness(t, options = {}) {
 	const repoRoot = join(rootDir, "repo");
 	const agentDir = join(rootDir, "agent-dir");
 	const parentSessionDir = join(rootDir, "sessions");
-	const tmuxSocket = join(rootDir, "tmux.sock");
 	const sessionName = `it-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+	const parentTabName = "parent";
 
 	const { provider, modelId } = parseModelSpec(MODEL_SPEC);
 
@@ -656,24 +639,29 @@ exec pi --model ${JSON.stringify(MODEL_SPEC)} --thinking minimal --session-dir $
 		PI_OFFLINE: "1",
 	};
 
-	tmux(
-		{ tmuxSocket },
-		["new-session", "-d", "-s", sessionName, "-x", "180", "-y", "55", `bash ${launchScript}`],
-		{ env },
+	// Create a KDL layout file for the parent zellij session
+	const layoutPath = join(rootDir, "parent-layout.kdl");
+	await writeFile(
+		layoutPath,
+		`layout {\n    tab name="${parentTabName}" {\n        pane command="bash" {\n            args "${launchScript}"\n            cwd "${repoRoot}"\n        }\n    }\n}\n`,
 	);
+
+	// Start a detached zellij session with the parent layout
+	run("zellij", ["-s", sessionName, "--new-session-with-layout", layoutPath], {
+		env: { ...env, ZELLIJ_SESSION_NAME: sessionName },
+	});
 
 	const harness = {
 		rootDir,
 		repoRoot,
 		agentDir,
 		parentSessionDir,
-		tmuxSocket,
 		sessionName,
-		parentTarget: `${sessionName}:0`,
+		parentTabName,
 	};
 
 	t.after(async () => {
-		tmux(harness, ["kill-server"], { allowFailure: true });
+		run("zellij", ["kill-session", sessionName], { allowFailure: true });
 		await rm(rootDir, { recursive: true, force: true });
 	});
 
@@ -734,7 +722,7 @@ function spawnWithCapture(command, args, options = {}) {
 }
 
 test(
-	"integration: /agent launch + agent-check/agent-send tools + child press-any-key close",
+	"integration: /agent launch + agent-check/agent-send tools + child zellij-tab close",
 	{ timeout: TEST_TIMEOUT },
 	async (t) => {
 		if (!assertAuthOrSkip(t)) return;
@@ -783,7 +771,7 @@ test(
 		);
 		assert.equal(lock.agentId, agentId);
 		assert.equal(lock.branch, started.branch);
-		assert.equal(lock.tmuxWindowId, started.tmuxWindowId);
+		assert.equal(lock.zellijTabName, started.zellijTabName);
 
 		await waitForParentContains(harness, `${agentId}:`, 45_000);
 
@@ -819,7 +807,7 @@ test(
 			`expected unknown-agent error after cleanup: ${JSON.stringify(doneCheck.payload)}`,
 		);
 
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );
 
@@ -888,7 +876,7 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );
 
@@ -915,7 +903,7 @@ test(
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );
 
@@ -942,7 +930,7 @@ test(
 		assert.equal(firstQuitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(firstQuitSend.payload)}`);
 		await callAgentSendTool(harness, firstId, "!/quit", 60_000);
 		await waitForAgent(harness, firstId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, firstId);
+		await waitForChildTabClosed(harness, firstId);
 
 		const firstLockPath = join(first.worktreePath, ".pi", "active.lock");
 		if (await exists(firstLockPath)) {
@@ -959,12 +947,12 @@ test(
 		assert.equal(secondQuitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(secondQuitSend.payload)}`);
 		await callAgentSendTool(harness, secondId, "!/quit", 60_000);
 		await waitForAgent(harness, secondId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, secondId);
+		await waitForChildTabClosed(harness, secondId);
 	},
 );
 
 test(
-	"integration: concurrent multiple agents from one parent with distinct windows/worktrees",
+	"integration: concurrent multiple agents from one parent with distinct tabs/worktrees",
 	{ timeout: TEST_TIMEOUT },
 	async (t) => {
 		if (!assertAuthOrSkip(t)) return;
@@ -984,11 +972,10 @@ test(
 
 		assert.ok(a1 && a2, "both agents should exist in registry");
 		assert.notEqual(a1.worktreePath, a2.worktreePath, "concurrent agents should use different worktrees");
-		assert.notEqual(a1.tmuxWindowId, a2.tmuxWindowId, "concurrent agents should use different tmux windows");
-		assert.notEqual(a1.tmuxWindowIndex, a2.tmuxWindowIndex, "concurrent agents should use different tmux indices");
+		assert.notEqual(a1.zellijTabName, a2.zellijTabName, "concurrent agents should use different zellij tabs");
 
-		assert.equal(windowExists(harness, a1.tmuxWindowId), true, `${firstId} window should exist`);
-		assert.equal(windowExists(harness, a2.tmuxWindowId), true, `${secondId} window should exist`);
+		assert.equal(tabExists(harness, a1.zellijTabName), true, `${firstId} tab should exist`);
+		assert.equal(tabExists(harness, a2.zellijTabName), true, `${secondId} tab should exist`);
 
 		await sendParentCommand(harness, "/agents");
 		await waitForParentContains(harness, firstId, 30_000);
@@ -1007,11 +994,8 @@ test(
 		await waitForAgent(harness, firstId, { terminal: true, timeoutMs: 120_000 });
 		await waitForAgent(harness, secondId, { terminal: true, timeoutMs: 180_000 });
 
-		await waitForBacklogContains(harness, firstId, "Press any key to close this tmux window", 60_000);
-		await waitForBacklogContains(harness, secondId, "Press any key to close this tmux window", 60_000);
-
-		await closeChildWindowAfterPrompt(harness, firstId);
-		await closeChildWindowAfterPrompt(harness, secondId);
+		await waitForChildTabClosed(harness, firstId);
+		await waitForChildTabClosed(harness, secondId);
 	},
 );
 
@@ -1233,15 +1217,14 @@ test(
 		assert.ok(typeof checkedAgent.task === "string", "agent.task should be present");
 		assert.ok(typeof checkedAgent.startedAt === "string", "agent.startedAt should be present");
 		assert.ok(Array.isArray(checkedAgent.warnings), "agent.warnings should be an array");
-		assert.ok(typeof checkedAgent.tmuxWindowId === "string", "agent.tmuxWindowId should be a string");
-		assert.ok(typeof checkedAgent.tmuxWindowIndex === "number", "agent.tmuxWindowIndex should be a number");
+		assert.ok(typeof checkedAgent.zellijTabName === "string", "agent.zellijTabName should be a string");
 		assert.ok(typeof checkedAgent.worktreePath === "string", "agent.worktreePath should be present");
 
-		// Verify the tmux fields match what the registry recorded
+		// Verify the zellij fields match what the registry recorded
 		const reg = await readRegistry(harness);
 		const rec = reg.agents[agentId];
 		assert.ok(rec, `${agentId} must exist in registry`);
-		assert.equal(rec.tmuxWindowId, spawned.tmuxWindowId, "registry tmuxWindowId should match spawned value");
+		assert.equal(rec.zellijTabName, spawned.zellijTabName, "registry zellijTabName should match spawned value");
 		assert.equal(rec.branch, spawned.branch, "registry branch should follow naming convention");
 
 		// Cleanup — wait for child Pi to boot before sending !/quit so the
@@ -1252,7 +1235,7 @@ test(
 
 		// ── Validate backlog captures visible pane content, not just footer ──
 		// After the child has booted, agent-check backlog should contain
-		// meaningful content from the visible tmux pane (e.g. "pi v" version
+		// meaningful content from the visible zellij pane (e.g. "pi v" version
 		// string), not just TUI footer/status bar redraws.
 		const bootedCheck = await callAgentCheckTool(harness, agentId, 60_000);
 		assert.equal(bootedCheck.payload.ok, true, "agent-check after boot should succeed");
@@ -1275,7 +1258,7 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );
 
@@ -1285,12 +1268,12 @@ test(
 //
 // WHY THIS IS A GENUINE END-TO-END INTEGRATION TEST:
 //
-//   createHarness() starts a real Pi process inside a real tmux session backed
+//   createHarness() starts a real Pi process inside a real zellij session backed
 //   by a real isolated git repository.  sendParentCommand() types real
-//   keystrokes into the tmux pane; Pi's configured LLM (a live network call,
+//   keystrokes into the zellij pane; Pi's configured LLM (a live network call,
 //   no mocking) processes the message and decides to invoke agent-start.
 //   Pi's extension framework runs the real agent-start execute() which creates
-//   a real git worktree, spawns a real child tmux window, and writes to the
+//   a real git worktree, spawns a real child zellij tab, and writes to the
 //   real registry.json.  Pi then records the exact JSON returned by execute()
 //   as a ToolResultMessage in its session JSONL file — that JSONL is the only
 //   authoritative record of what execute() returned to the LLM.  Reading it
@@ -1299,15 +1282,15 @@ test(
 //
 //   In addition, the test cross-validates the tool result against observable
 //   external effects:
-//     • waitForSpawnedAgent confirms the registry was written with all tmux
+//     • waitForSpawnedAgent confirms the registry was written with all zellij
 //       and worktree fields (side-effects of a successful execute()).
-//     • windowExists(harness, sp.tmuxWindowId) confirms the tmuxWindowId
-//       reported in the tool result refers to a real live tmux window in the
-//       harness's tmux server — not an invented string.
+//     • tabExists(harness, sp.zellijTabName) confirms the zellijTabName
+//       reported in the tool result refers to a real live zellij tab in the
+//       harness's zellij session — not an invented string.
 //     • readRegistry() cross-checks that the registry fields match what the
 //       tool result reported, proving the two sources agree.
 //
-// Bug fixed: agent-start execute() returned { id, tmuxWindowId, ... } without
+// Bug fixed: agent-start execute() returned { id, zellijTabName, ... } without
 // an ok field.  The LLM tool contract requires { ok: true, ... } on success.
 // ---------------------------------------------------------------------------
 test(
@@ -1329,7 +1312,7 @@ test(
 			`Please start a new side agent worker for me. The agent's task is: "integration-test worker — immediately type /quit to exit". Use the agent-start tool to create the agent now.`,
 		);
 
-		// Wait for the agent to appear in the registry with all tmux and
+		// Wait for the agent to appear in the registry with all zellij and
 		// worktree fields populated — proves the tool's side-effects ran.
 		const spawned = await waitForNewSpawnedAgent(harness, beforeIds, 180_000);
 		const agentId = spawned.id;
@@ -1345,10 +1328,9 @@ test(
 		// — Required field shapes ——————————————————————————————————————————————
 		assert.strictEqual(sp.id, agentId, `tool result id should match spawned id, got: ${sp.id}`);
 		assert.ok(
-			typeof sp.tmuxWindowId === "string" && sp.tmuxWindowId.startsWith("@"),
-			`tmuxWindowId must be a "@N" string, got: ${sp.tmuxWindowId}`,
+			typeof sp.zellijTabName === "string" && sp.zellijTabName.length > 0,
+			`zellijTabName must be a non-empty string, got: ${sp.zellijTabName}`,
 		);
-		assert.ok(typeof sp.tmuxWindowIndex === "number", `tmuxWindowIndex must be a number, got: ${sp.tmuxWindowIndex}`);
 		assert.ok(
 			typeof sp.worktreePath === "string" && sp.worktreePath.length > 0,
 			`worktreePath must be a non-empty string, got: ${sp.worktreePath}`,
@@ -1357,12 +1339,12 @@ test(
 		assert.ok(Array.isArray(sp.warnings), `warnings must be an array, got: ${JSON.stringify(sp.warnings)}`);
 
 		// — External-effect cross-checks: tool result fields refer to real resources —
-		// The tmuxWindowId in the tool result must be a live window in THIS harness's
-		// tmux server.  If execute() had returned a fabricated id or crashed before
-		// creating the window, this assertion would catch it.
+		// The zellijTabName in the tool result must be a live tab in THIS harness's
+		// zellij session.  If execute() had returned a fabricated name or crashed
+		// before creating the tab, this assertion would catch it.
 		assert.ok(
-			windowExists(harness, sp.tmuxWindowId),
-			`tmuxWindowId "${sp.tmuxWindowId}" from tool result must be a real live tmux window in the harness`,
+			tabExists(harness, sp.zellijTabName),
+			`zellijTabName "${sp.zellijTabName}" from tool result must be a real live zellij tab in the harness`,
 		);
 
 		// Registry fields must match tool-result fields: the tool wrote them
@@ -1370,10 +1352,10 @@ test(
 		const reg = await readRegistry(harness);
 		const rec = reg.agents[agentId];
 		assert.ok(rec, `${agentId} must exist in registry`);
-		assert.strictEqual(rec.tmuxWindowId, sp.tmuxWindowId, "registry tmuxWindowId must match tool result");
+		assert.strictEqual(rec.zellijTabName, sp.zellijTabName, "registry zellijTabName must match tool result");
 		assert.strictEqual(rec.branch, sp.branch, "registry branch must match tool result");
 		assert.strictEqual(rec.worktreePath, sp.worktreePath, "registry worktreePath must match tool result");
-		assert.strictEqual(rec.tmuxWindowId, spawned.tmuxWindowId, "spawned tmuxWindowId must match tool result");
+		assert.strictEqual(rec.zellijTabName, spawned.zellijTabName, "spawned zellijTabName must match tool result");
 
 		// — agent-wait-any behavior after successful auto-prune ————————————
 		// Terminate the agent, wait for registry cleanup, then ask the LLM to call
@@ -1410,7 +1392,7 @@ test(
 			`error should explain missing/pruned id, got: ${wp.error}`,
 		);
 
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );
 
@@ -1419,7 +1401,7 @@ test(
 //
 // WHY THIS IS A GENUINE END-TO-END INTEGRATION TEST:
 //
-//   Same full stack as Test 2: real tmux → real Pi process → real LLM call →
+//   Same full stack as Test 2: real zellij → real Pi process → real LLM call →
 //   real agent-wait-any execute() → real session JSONL written by Pi.
 //   The session JSONL is not a mock; it is the authentic record of what
 //   execute() returned after the real LLM decided to invoke the tool.
@@ -1513,7 +1495,7 @@ test(
 //
 // WHY THIS IS A GENUINE END-TO-END INTEGRATION TEST:
 //
-//   1. /agent starts a real child Pi process in a real tmux window.
+//   1. /agent starts a real child Pi process in a real zellij tab.
 //   2. The parent is prompted to invoke the real `agent-send` tool.
 //   3. The tool sends real keystrokes (including interrupt + 300 ms pause).
 //   4. Assertions read the real child backlog.log for unique tokens.
@@ -1560,6 +1542,6 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `quit agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await waitForChildTabClosed(harness, agentId);
 	},
 );

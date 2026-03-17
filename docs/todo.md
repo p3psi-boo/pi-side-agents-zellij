@@ -23,8 +23,8 @@
 - [x] Implement command parser for `/agent [-model ...] <task>`.
 - [x] Implement kickoff prompt builder (task + optional context summary).
 - [x] Allocate agent id and initialize registry record.
-- [x] Spawn child Pi in new tmux window.
-- [x] Return immediate user confirmation including agent id + tmux window.
+- [x] Spawn child Pi in new zellij tab.
+- [x] Return immediate user confirmation including agent id + zellij tab.
 
 **Exit criteria**: ✅ user can launch child agent and continue working in parent.
 
@@ -51,7 +51,7 @@
 ## Phase 4 — Statusline + observability
 
 - [x] Expose active-agent summary from registry.
-- [x] Render status + tmux window id in project statusline.
+- [x] Render status + zellij tab name in project statusline.
 - [x] Implement `agent-check` payload with backlog tail.
 - [x] Add crash/failure diagnostics output.
 
@@ -77,7 +77,7 @@
 
 ## Phase 6 — Hardening
 
-- [ ] Retry policies for transient tmux/worktree failures.
+- [ ] Retry policies for transient zellij/worktree failures.
 - [ ] Graceful shutdown and cleanup on parent exit.
 - [x] Concurrency guards for registry writes/reads.
 - [x] Documentation for recovery runbooks (`docs/recovery.md`).

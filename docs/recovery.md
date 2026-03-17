@@ -5,6 +5,8 @@ Practical recovery steps for common side-agent failures.
 > Assumptions: run commands from the **parent repo root** (git toplevel), unless noted.
 >
 > Agent IDs are **slugs** (e.g. `fix-auth-leak`, `add-auth-tests-2`). Replace examples accordingly.
+>
+> If you run zellij commands from outside the active parent session, add `--session <name>`.
 
 ## Quick state map
 
@@ -15,6 +17,9 @@ Practical recovery steps for common side-agent failures.
   - `.pi/side-agents/runtime/<agent-id>/backlog.log`
   - `.pi/side-agents/runtime/<agent-id>/exit.json`
   - `.pi/side-agents/runtime/<agent-id>/launch.sh`
+  - `.pi/side-agents/runtime/<agent-id>/layout.kdl`
+  - `.pi/side-agents/runtime/<agent-id>/pane.id`
+  - `.pi/side-agents/runtime/<agent-id>/launcher.pid`
 - Runtime archive (if an agent id was reused):
   - `.pi/side-agents/runtime-archive/<agent-id>/...`
 - Worktree lock per agent slot:
@@ -63,13 +68,13 @@ find ".pi/side-agents/runtime-archive/$ID" -maxdepth 3 -type f -name backlog.log
 
 ---
 
-## 2) Agent crashed / tmux window disappeared
+## 2) Agent crashed / zellij tab disappeared
 
 ### Symptoms
 
 - Agent status becomes `crashed`
-- Error often: `tmux window disappeared before an exit marker was recorded`
-- `agent-send` returns `tmux window is not active`
+- Error often: `zellij tab disappeared before an exit marker was recorded`
+- `agent-send` returns `zellij tab is not active`
 
 ### Recovery
 
@@ -88,17 +93,23 @@ tail -n 120 ".pi/side-agents/runtime/$ID/backlog.log"
 [ -f ".pi/side-agents/runtime/$ID/exit.json" ] && cat ".pi/side-agents/runtime/$ID/exit.json"
 ```
 
-3. If tmux window still exists, try graceful stop (tool):
+3. If the zellij tab still exists, try graceful stop (tool):
 
 ```text
 agent-send { "id": "<id>", "prompt": "!/quit" }
 ```
 
-4. If tmux window is gone, treat as terminal crash:
+4. If the zellij tab is gone, treat as terminal crash:
 
 - collect backlog/error
 - spawn a replacement agent if needed (`/agent ...` or `agent-start`)
 - clean up old failed/crashed record (see section 5)
+
+5. If you need to manually check tab presence:
+
+```bash
+zellij action query-tab-names 2>/dev/null || true
+```
 
 ---
 
@@ -157,7 +168,7 @@ find .. -maxdepth 2 -type f -path "../${REPO_NAME}-agent-worktree-*/.pi/active.l
 
 3. Fast path: run `/agents` and confirm **Reclaim orphan worktree locks?** when offered.
 
-- This only targets orphan locks with **no tracked registry agent** and **no live pid/tmux signal**.
+- This only targets orphan locks with **no tracked registry agent** and **no live pid/tab signal**.
 
 4. Manual cleanup (if you prefer): remove lock files directly:
 
@@ -200,10 +211,12 @@ rm -rf ".pi/side-agents/runtime/$ID"
 rm -f "$WT/.pi/active.lock"
 ```
 
-5. If tmux window still exists unexpectedly, close it:
+5. If the zellij tab still exists unexpectedly, close it:
 
 ```bash
-tmux kill-window -t "@<window-id>" 2>/dev/null || true
+TAB="agent-fix-auth-leak"
+zellij action go-to-tab-name "$TAB" 2>/dev/null || true
+zellij action close-tab 2>/dev/null || true
 ```
 
 ---
@@ -213,8 +226,8 @@ tmux kill-window -t "@<window-id>" 2>/dev/null || true
 ### Read-only inspection
 
 ```bash
-# Registry summary (id, status, tmux window, worktree)
-node -e 'const fs=require("fs");const p=".pi/side-agents/registry.json";if(!fs.existsSync(p)){console.log("registry missing");process.exit(0)};const r=JSON.parse(fs.readFileSync(p,"utf8"));for(const id of Object.keys(r.agents||{}).sort()){const a=r.agents[id];console.log(`${id}\t${a.status}\t${a.tmuxWindowId??"-"}\t${a.worktreePath??"-"}`)}'
+# Registry summary (id, status, zellij tab, worktree)
+node -e 'const fs=require("fs");const p=".pi/side-agents/registry.json";if(!fs.existsSync(p)){console.log("registry missing");process.exit(0)};const r=JSON.parse(fs.readFileSync(p,"utf8"));for(const id of Object.keys(r.agents||{}).sort()){const a=r.agents[id];console.log(`${id}\t${a.status}\t${a.zellijTabName??"-"}\t${a.worktreePath??"-"}`)}'
 
 # Runtime dirs
 find .pi/side-agents/runtime -maxdepth 2 -mindepth 2 -type d 2>/dev/null | sort
