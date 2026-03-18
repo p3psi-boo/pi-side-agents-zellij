@@ -161,6 +161,10 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function shellJoin(args: string[]): string {
+	return args.map((value) => shellQuote(value)).join(" ");
+}
+
 function emptyRegistry(): RegistryFile {
 	return {
 		version: REGISTRY_VERSION,
@@ -1106,12 +1110,21 @@ function buildLaunchScript(params: {
 	parentRepoRoot: string;
 	stateRoot: string;
 	worktreePath: string;
-	promptPath: string;
+	prompt: string;
 	exitFile: string;
 	modelSpec?: string;
 	runtimeDir: string;
 	backlogPath: string;
 }): string {
+	const childSkillsDir = join(params.worktreePath, ".pi", "side-agent-skills");
+	const piCommand = shellJoin([
+		"pi",
+		...(params.modelSpec ? ["--model", params.modelSpec] : []),
+		"--skill",
+		childSkillsDir,
+		params.prompt,
+	]);
+
 	return `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -1120,15 +1133,13 @@ PARENT_SESSION=${shellQuote(params.parentSessionId ?? "")}
 PARENT_REPO=${shellQuote(params.parentRepoRoot)}
 STATE_ROOT=${shellQuote(params.stateRoot)}
 WORKTREE=${shellQuote(params.worktreePath)}
-PROMPT_FILE=${shellQuote(params.promptPath)}
 EXIT_FILE=${shellQuote(params.exitFile)}
-MODEL_SPEC=${shellQuote(params.modelSpec ?? "")}
 RUNTIME_DIR=${shellQuote(params.runtimeDir)}
 BACKLOG_LOG=${shellQuote(params.backlogPath)}
 START_SCRIPT=\"$WORKTREE/.pi/side-agent-start.sh\"
-CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
 PANE_ID_FILE=\"$RUNTIME_DIR/pane.id\"
 LAUNCHER_PID_FILE=\"$RUNTIME_DIR/launcher.pid\"
+PI_COMMAND=${shellQuote(piCommand)}
 
 export ${ENV_AGENT_ID}=\"$AGENT_ID\"
 export ${ENV_PARENT_SESSION}=\"$PARENT_SESSION\"
@@ -1159,17 +1170,9 @@ if [[ -x "$START_SCRIPT" ]]; then
   fi
 fi
 
-PI_CMD=(pi)
-if [[ -n "$MODEL_SPEC" ]]; then
-  PI_CMD+=(--model "$MODEL_SPEC")
-fi
-if [[ -d "$CHILD_SKILLS_DIR" ]]; then
-  # agent-setup writes the child-only finish skill here; load it explicitly.
-  PI_CMD+=(--skill "$CHILD_SKILLS_DIR")
-fi
-
 set +e
-script -qf "$BACKLOG_LOG" -c "\\"\${PI_CMD[@]}\\" \\"$(cat "$PROMPT_FILE")\\""
+# script -c expects one shell command string; pre-quote it so pi flags stay attached to pi.
+script -qf "$BACKLOG_LOG" -c "$PI_COMMAND"
 exit_code=$?
 set -e
 
@@ -1555,7 +1558,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			parentRepoRoot: repoRoot,
 			stateRoot,
 			worktreePath: worktree.worktreePath,
-			promptPath,
+			prompt: kickoff.prompt,
 			exitFile,
 			modelSpec,
 			runtimeDir,

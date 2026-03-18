@@ -15,6 +15,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -68,6 +69,14 @@ function truncateWithEllipsis(text, maxChars) {
 function summarizeTask(task, maxChars = 220) {
 	const collapsed = stripTerminalNoise(task).replace(/\s+/g, " ").trim();
 	return truncateWithEllipsis(collapsed, maxChars);
+}
+
+function shellQuote(value) {
+	return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function shellJoin(args) {
+	return args.map((value) => shellQuote(value)).join(" ");
 }
 
 function collectRecentBacklogLines(lines, minimumLines) {
@@ -781,6 +790,30 @@ test("agent-send '/' prefix is forwarded verbatim (no special parse)", () => {
 	const r = parsePrompt("/quit");
 	assert.ok(!r.interrupted);
 	assert.strictEqual(r.text, "/quit", "slash command is forwarded as-is");
+});
+
+test("launch script quoting keeps script -c flags attached to pi command", (t) => {
+	const scriptCheck = spawnSync("bash", ["-lc", "command -v script >/dev/null 2>&1"], { encoding: "utf8" });
+	if (scriptCheck.status !== 0) {
+		t.skip("requires util-linux script");
+		return;
+	}
+
+	const prompt = 'line one "quoted"\nline two';
+	const command = shellJoin([
+		"bash",
+		"-lc",
+		"printf '%s\\n' \"$1|$2|$3\"",
+		"side-agent",
+		"--model",
+		"/tmp/skills",
+		prompt,
+	]);
+	const result = spawnSync("script", ["-qf", "/dev/null", "-c", command], { encoding: "utf8" });
+
+	assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+	assert.match(result.stdout, /--model\|\/tmp\/skills\|line one "quoted"/);
+	assert.match(result.stdout, /line two/);
 });
 
 // ---------------------------------------------------------------------------
